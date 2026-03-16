@@ -1,0 +1,15 @@
+LICENSE
+README.md
+pyproject.toml
+telegrip/__init__.py
+telegrip/__main__.py
+telegrip/config.py
+telegrip/control_loop.py
+telegrip/main.py
+telegrip/utils.py
+telegrip.egg-info/PKG-INFO
+telegrip.egg-info/SOURCES.txt
+telegrip.egg-info/dependency_links.txt
+telegrip.egg-info/entry_points.txt
+telegrip.egg-info/requires.txt
+telegrip.egg-info/top_level.txt

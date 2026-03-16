@@ -1,0 +1,45 @@
+control:
+  keyboard:
+    angle_step: 5
+    enabled: true
+    gripper_step: 10.0
+    pos_step: 0.01
+  use_mink: true
+  mink:
+    enabled: true
+    mujoco_scene: mink/examples/arm620/scene_dual_unified_base.xml
+    end_effector_site: tools_link
+  pybullet:
+    enabled: true
+  vr:
+    enabled: true
+gripper:
+  closed_angle: 45.0
+  open_angle: 0.0
+ik:
+  use_reference_poses: true
+  reference_poses_file: reference_poses_arm620.json
+  position_error_threshold: 0.001
+  hysteresis_threshold: 0.05
+  movement_penalty_weight: 0.01
+network:
+  host_ip: 0.0.0.0
+  https_port: 8443
+  websocket_port: 8442
+paths:
+  urdf_path: mink/examples/arm620/urdf/arm620.urdf
+robot:
+  left_arm:
+    enabled: true
+    name: Left ARM620
+    interface: rclpy
+  right_arm:
+    enabled: true
+    name: Right ARM620
+    interface: rclpy
+  send_interval: 0.001
+  require_state_feedback: false
+  vr_to_robot_scale: 1
+ssl:
+  certfile: cert.pem
+  keyfile: key.pem

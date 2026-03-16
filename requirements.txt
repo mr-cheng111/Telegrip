@@ -1,0 +1,18 @@
+# Basic requirements for telegrip package
+# For development with pinned versions, use: pip install -r requirements-dev.txt
+# For installation as package, use: pip install -e .
+
+numpy
+torch
+scipy
+mujoco>=3.0.0
+websockets
+pynput
+rclpy
+std_msgs
+sensor_msgs
+# For development
+pytest
+black
+flake8
+pyyaml>=6.0 

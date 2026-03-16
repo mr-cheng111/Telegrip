@@ -1,0 +1,6 @@
+Thu Mar 12 09:25:54 2026
+ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
+
+Thu Mar 12 09:32:00 2026
+ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
+

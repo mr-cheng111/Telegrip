@@ -1,0 +1,14 @@
+numpy
+torch
+websockets
+pynput
+scipy
+pyyaml
+mujoco>=3.0.0
+
+[dev]
+pytest
+pytest-asyncio
+black
+flake8
+mypy

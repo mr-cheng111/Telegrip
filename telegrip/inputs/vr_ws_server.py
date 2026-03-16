@@ -1,0 +1,605 @@
+"""
+VR WebSocket server for receiving controller data from web browsers.
+Adapted from the original vr_robot_teleop.py script.
+"""
+
+import asyncio
+import json
+import ssl
+import time
+import websockets
+import numpy as np
+import math
+import logging
+from typing import Dict, Optional, Set
+from scipy.spatial.transform import Rotation as R
+
+from .base import BaseInputProvider, ControlGoal, ControlMode
+from ..config import TelegripConfig, get_config_data, update_config_data
+from ..core.kinematics import compute_relative_position
+
+logger = logging.getLogger(__name__)
+
+
+class VRControllerState:
+    """State tracking for a VR controller."""
+    
+    def __init__(self, hand: str):
+        self.hand = hand
+        self.grip_active = False
+        self.trigger_active = False
+        
+        # Position tracking for relative movement
+        self.origin_position = None
+        self.origin_rotation = None
+        
+        # Quaternion-based rotation tracking (more stable than Euler)
+        self.origin_quaternion = None
+        self.accumulated_rotation_quat = None  # Accumulated rotation as quaternion
+        
+        # Rotation tracking for wrist control
+        self.z_axis_rotation = 0.0  # For wrist_roll
+        self.x_axis_rotation = 0.0  # For wrist_flex (pitch)
+        
+        # Position tracking
+        self.current_position = None
+        
+        # Rotation tracking
+        self.origin_wrist_angle = 0.0
+    
+    def reset_grip(self):
+        """Reset grip state but preserve trigger state."""
+        self.grip_active = False
+        self.origin_position = None
+        self.origin_rotation = None
+        self.origin_quaternion = None
+        self.accumulated_rotation_quat = None
+        self.z_axis_rotation = 0.0
+        self.x_axis_rotation = 0.0
+
+
+class VRWebSocketServer(BaseInputProvider):
+    """WebSocket server for VR controller input."""
+    
+    def __init__(self, command_queue: asyncio.Queue, config: TelegripConfig):
+        super().__init__(command_queue)
+        self.config = config
+        self.clients: Set = set()
+        self.server = None
+        
+        # Controller states
+        self.left_controller = VRControllerState("left")
+        self.right_controller = VRControllerState("right")
+        
+        # Robot state tracking (for relative position calculation)
+        self.left_arm_origin_position = None
+        self.right_arm_origin_position = None
+        # Global orientation calibration references in controller quaternion order [x, y, z, w].
+        self.hand_orientation_ref_xyzw = {"left": None, "right": None}
+        self._load_orientation_refs_from_config()
+        self._calib_hold_start_ts = None
+        self._calib_hold_done = False
+
+    @staticmethod
+    def _normalize_xyzw(q: np.ndarray) -> np.ndarray:
+        arr = np.asarray(q, dtype=float).reshape(-1)[:4]
+        n = np.linalg.norm(arr)
+        if n <= 1e-12:
+            return None
+        return arr / n
+
+    def _load_orientation_refs_from_config(self):
+        """Load saved orientation reference quaternions from config.yaml."""
+        try:
+            cfg = get_config_data()
+            refs = (
+                cfg.get("control", {})
+                .get("vr", {})
+                .get("orientation_reference_quat_xyzw", {})
+            )
+            for hand in ("left", "right"):
+                q = refs.get(hand)
+                if isinstance(q, list) and len(q) >= 4:
+                    nq = self._normalize_xyzw(np.array(q[:4], dtype=float))
+                    if nq is not None:
+                        self.hand_orientation_ref_xyzw[hand] = nq
+            if self.hand_orientation_ref_xyzw["left"] is not None and self.hand_orientation_ref_xyzw["right"] is not None:
+                logger.info("Loaded VR orientation references from config.yaml")
+        except Exception as e:
+            logger.warning(f"Could not load VR orientation references from config.yaml: {e}")
+
+    def _save_orientation_refs_to_config(self):
+        """Persist orientation reference quaternions into config.yaml."""
+        cfg = get_config_data()
+        control = cfg.setdefault("control", {})
+        vr = control.setdefault("vr", {})
+        vr["orientation_reference_quat_xyzw"] = {
+            "left": self.hand_orientation_ref_xyzw["left"].tolist(),
+            "right": self.hand_orientation_ref_xyzw["right"].tolist(),
+        }
+        update_config_data(cfg)
+
+    def _update_orientation_calibration_hold(self, left_data: Dict, right_data: Dict):
+        """Hold-to-calibrate: left X + right A for 3s to set orientation references."""
+        # Trigger-like value path (same style as trigger > 0.5), then fallbacks.
+        lx = float(left_data.get("x", 0.0)) > 0.5
+        ra = float(right_data.get("a", 0.0)) > 0.5
+        if not lx:
+            lx = bool(left_data.get("xButton", False))
+        if not ra:
+            ra = bool(right_data.get("aButton", False))
+        if not lx:
+            lbtn = left_data.get("buttons", [])
+            if isinstance(lbtn, list):
+                try:
+                    lx = (
+                        (len(lbtn) > 3 and float(lbtn[3]) > 0.5)
+                        or (len(lbtn) > 4 and float(lbtn[4]) > 0.5)
+                    )
+                except Exception:
+                    lx = False
+        if not ra:
+            rbtn = right_data.get("buttons", [])
+            if isinstance(rbtn, list):
+                try:
+                    ra = (
+                        (len(rbtn) > 3 and float(rbtn[3]) > 0.5)
+                        or (len(rbtn) > 4 and float(rbtn[4]) > 0.5)
+                    )
+                except Exception:
+                    ra = False
+        lq = left_data.get("quaternion") or {}
+        rq = right_data.get("quaternion") or {}
+        has_lq = all(k in lq for k in ("x", "y", "z", "w"))
+        has_rq = all(k in rq for k in ("x", "y", "z", "w"))
+        combo_active = lx and ra and has_lq and has_rq
+
+        now = time.time()
+
+        if not combo_active:
+            self._calib_hold_start_ts = None
+            self._calib_hold_done = False
+            return
+
+        if self._calib_hold_start_ts is None:
+            self._calib_hold_start_ts = now
+            self._calib_hold_done = False
+            print(
+                "[calib] hold started: LEFT X + RIGHT A detected, keep holding for 3s...",
+                flush=True,
+            )
+            return
+
+        if self._calib_hold_done:
+            return
+
+        if now - self._calib_hold_start_ts >= 3.0:
+            left_ref = self._normalize_xyzw(
+                np.array([float(lq["x"]), float(lq["y"]), float(lq["z"]), float(lq["w"])], dtype=float)
+            )
+            right_ref = self._normalize_xyzw(
+                np.array([float(rq["x"]), float(rq["y"]), float(rq["z"]), float(rq["w"])], dtype=float)
+            )
+            if left_ref is None or right_ref is None:
+                logger.warning("Calibration failed: invalid controller quaternion data")
+                return
+            self.hand_orientation_ref_xyzw["left"] = left_ref
+            self.hand_orientation_ref_xyzw["right"] = right_ref
+            self._save_orientation_refs_to_config()
+            self._calib_hold_done = True
+            print("✅ [calib] orientation calibration updated and saved to config.yaml", flush=True)
+            print("✅ [calib] new initial coordinate system has been applied", flush=True)
+
+    def _get_local_ip(self) -> str:
+        """Get the local IP address of this machine."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                return "localhost"
+
+    def setup_ssl(self) -> Optional[ssl.SSLContext]:
+        """Setup SSL context for WebSocket server."""
+        # Automatically generate SSL certificates if they don't exist
+        if not self.config.ssl_files_exist:
+            logger.info("SSL certificates not found for WebSocket server, attempting to generate them...")
+            if not self.config.ensure_ssl_certificates():
+                logger.error("Failed to generate SSL certificates for WebSocket server")
+                return None
+        
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            # Get absolute paths for SSL certificates
+            cert_path, key_path = self.config.get_absolute_ssl_paths()
+            ssl_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            logger.info("SSL certificate and key loaded successfully for WebSocket server")
+            return ssl_context
+        except ssl.SSLError as e:
+            logger.error(f"Error loading SSL cert/key: {e}")
+            return None
+    
+    async def start(self):
+        """Start the WebSocket server."""
+        if not self.config.enable_vr:
+            logger.info("VR WebSocket server disabled in configuration")
+            return
+        
+        ssl_context = self.setup_ssl()
+        if ssl_context is None:
+            logger.error("Failed to setup SSL for WebSocket server")
+            return
+        
+        host = self.config.host_ip
+        port = self.config.websocket_port
+        self._browser_warning_shown = False
+
+        try:
+            self.server = await websockets.serve(
+                self.websocket_handler,
+                host,
+                port,
+                ssl=ssl_context,
+                process_request=self._process_request
+            )
+            self.is_running = True
+            host_display = self._get_local_ip() if host == "0.0.0.0" else host
+            logger.info(f"VR WebSocket server running on wss://{host_display}:{port}")
+        except Exception as e:
+            logger.error(f"Failed to start WebSocket server: {e}")
+
+    async def _process_request(self, connection, request):
+        """Process incoming requests and detect browser visits to the WebSocket port."""
+        # Check if this looks like a browser request (not a proper WebSocket upgrade)
+        # In newer websockets versions, request.headers is a Headers object
+        headers = request.headers
+        connection_header = headers.get("Connection", "")
+        upgrade_header = headers.get("Upgrade", "")
+
+        # Proper WebSocket requests have "Upgrade" in Connection header and "websocket" in Upgrade header
+        is_websocket_request = (
+            "upgrade" in connection_header.lower() and
+            "websocket" in upgrade_header.lower()
+        )
+
+        if not is_websocket_request:
+            # Only show warning once to avoid spam
+            if not self._browser_warning_shown:
+                self._browser_warning_shown = True
+                host_display = self._get_local_ip() if self.config.host_ip == "0.0.0.0" else self.config.host_ip
+                print(f"\n⚠️  Someone is trying to open port {self.config.websocket_port} in a browser.")
+                print(f"   This port is for VR WebSocket connections only.")
+                print(f"   The web UI is at: https://{host_display}:{self.config.https_port}\n")
+
+        # Return None to let websockets library handle the request normally
+        # (it will reject non-WebSocket requests with 426 Upgrade Required)
+        return None
+
+    async def stop(self):
+        """Stop the WebSocket server."""
+        self.is_running = False
+
+        # Close all active client connections to unblock websocket_handler
+        for client in list(self.clients):
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+            logger.info("VR WebSocket server stopped")
+    
+    async def websocket_handler(self, websocket, path=None):
+        """Handle WebSocket connections from VR controllers."""
+        client_address = websocket.remote_address
+        logger.info(f"VR client connected: {client_address}")
+        self.clients.add(websocket)
+        
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    await self.process_controller_data(data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Received non-JSON message: {message}")
+                except Exception as e:
+                    logger.error(f"Error processing VR data: {e}")
+        
+        except websockets.exceptions.ConnectionClosedOK:
+            logger.info(f"VR client {client_address} disconnected normally")
+        except websockets.exceptions.ConnectionClosedError as e:
+            logger.warning(f"VR client {client_address} disconnected with error: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error with VR client {client_address}: {e}")
+        finally:
+            self.clients.discard(websocket)
+            # Handle grip releases when client disconnects
+            await self.handle_grip_release('left')
+            await self.handle_grip_release('right')
+            logger.info(f"VR client {client_address} cleanup complete")
+    
+    async def process_controller_data(self, data: Dict):
+        """Process incoming VR controller data."""
+        
+        # Handle new dual controller format
+        if 'leftController' in data and 'rightController' in data:
+            left_data = data['leftController']
+            right_data = data['rightController']
+            self._update_orientation_calibration_hold(left_data, right_data)
+            
+            # Process left controller
+            if left_data.get('position') and (left_data.get('gripActive', False) or left_data.get('trigger', 0) > 0.5):
+                await self.process_single_controller('left', left_data)
+            elif not left_data.get('gripActive', False) and self.left_controller.grip_active:
+                await self.handle_grip_release('left')
+            
+            # Process right controller
+            if right_data.get('position') and (right_data.get('gripActive', False) or right_data.get('trigger', 0) > 0.5):
+                await self.process_single_controller('right', right_data)
+            elif not right_data.get('gripActive', False) and self.right_controller.grip_active:
+                await self.handle_grip_release('right')
+                
+            return
+        
+        # Handle legacy single controller format
+        hand = data.get('hand')
+        
+        # Handle explicit release messages
+        if data.get('gripReleased'):
+            await self.handle_grip_release(hand)
+            return
+        
+        if data.get('triggerReleased'):
+            await self.handle_trigger_release(hand)
+            return
+            
+        # Process single controller data
+        if hand and data.get('position') and (data.get('gripActive', False) or data.get('trigger', 0) > 0.5):
+            await self.process_single_controller(hand, data)
+    
+    async def process_single_controller(self, hand: str, data: Dict):
+        """Process data for a single controller."""
+        position = data.get('position', {})
+        rotation = data.get('rotation', {})
+        quaternion = data.get('quaternion', {})  # Get quaternion data directly
+        grip_active = data.get('gripActive', False)
+        trigger = data.get('trigger', 0)
+        
+        controller = self.left_controller if hand == 'left' else self.right_controller
+        
+        # Handle trigger for gripper control
+        trigger_active = trigger > 0.5
+        if trigger_active != controller.trigger_active:
+            controller.trigger_active = trigger_active
+            
+            # Send gripper control goal - do not specify mode to avoid interfering with position control
+            # Trigger pressed -> close gripper; trigger released -> open gripper.
+            gripper_goal = ControlGoal(
+                arm=hand,
+                gripper_closed=trigger_active,
+                metadata={"source": "vr_trigger"}
+            )
+            await self.send_goal(gripper_goal)
+            
+            logger.info(f"🤏 {hand.upper()} gripper {'CLOSED' if trigger_active else 'OPENED'}")
+        
+        # Handle grip button for arm movement control
+        if grip_active:
+            if not controller.grip_active:
+                # Grip just activated - set origin and reset target position
+                controller.grip_active = True
+                controller.origin_position = position.copy()
+                
+                # Use quaternion data directly if available, otherwise fall back to Euler conversion
+                if quaternion and all(k in quaternion for k in ['x', 'y', 'z', 'w']):
+                    controller.origin_quaternion = np.array([quaternion['x'], quaternion['y'], quaternion['z'], quaternion['w']])
+                    controller.origin_rotation = controller.origin_quaternion  # Store for compatibility
+                else:
+                    # Fallback to Euler angle conversion
+                    controller.origin_quaternion = self.euler_to_quaternion(rotation) if rotation else None
+                    controller.origin_rotation = controller.origin_quaternion
+                
+                controller.accumulated_rotation_quat = controller.origin_quaternion
+                controller.z_axis_rotation = 0.0
+                controller.x_axis_rotation = 0.0
+                
+                # Send reset signal to control loop to reset target position to current robot position
+                reset_goal = ControlGoal(
+                    arm=hand,
+                    mode=ControlMode.POSITION_CONTROL,  # Keep in position control
+                    target_position=None,  # Special signal
+                    metadata={
+                        "source": f"vr_grip_reset_{hand}",
+                        "reset_target_to_current": True  # Signal to reset target to current position
+                    }
+                )
+                await self.send_goal(reset_goal)
+                
+                logger.info(f"🔒 {hand.upper()} grip activated - controlling {hand} arm (target reset to current position)")
+            
+            # Compute target position
+            if controller.origin_position:
+                relative_delta = compute_relative_position(
+                    position, 
+                    controller.origin_position, 
+                    self.config.vr_to_robot_scale
+                )
+                
+                # Calculate Z-axis rotation for wrist_roll control
+                # Calculate X-axis rotation for wrist_flex control
+                if controller.origin_quaternion is not None:
+                    # Update quaternion-based rotation tracking
+                    if quaternion and all(k in quaternion for k in ['x', 'y', 'z', 'w']):
+                        # Use quaternion data directly
+                        current_quat = np.array([quaternion['x'], quaternion['y'], quaternion['z'], quaternion['w']])
+                        self.update_quaternion_rotation_direct(controller, current_quat)
+                    else:
+                        # Fallback to Euler angle conversion
+                        self.update_quaternion_rotation(controller, rotation)
+                    
+                    # Get accumulated rotations from quaternion
+                    controller.z_axis_rotation = self.extract_roll_from_quaternion(controller.accumulated_rotation_quat, controller.origin_quaternion)
+                    controller.x_axis_rotation = self.extract_pitch_from_quaternion(controller.accumulated_rotation_quat, controller.origin_quaternion)
+                
+                marker_quat_wxyz = None
+                if quaternion and all(k in quaternion for k in ['x', 'y', 'z', 'w']):
+                    current_xyzw = self._normalize_xyzw(np.array([
+                        float(quaternion['x']),
+                        float(quaternion['y']),
+                        float(quaternion['z']),
+                        float(quaternion['w']),
+                    ], dtype=float))
+                    if current_xyzw is not None:
+                        ref_xyzw = self.hand_orientation_ref_xyzw.get(hand)
+                        if ref_xyzw is not None:
+                            # Controller local delta from calibration pose:
+                            # q_delta = inv(q_ref) * q_now  (xyzw)
+                            # This keeps "relative to init pose" semantics stable.
+                            rel_xyzw = (
+                                R.from_quat(ref_xyzw).inv()
+                                * R.from_quat(current_xyzw)
+                            ).as_quat()
+                            marker_quat_wxyz = np.array([
+                                float(rel_xyzw[3]),
+                                float(rel_xyzw[0]),
+                                float(rel_xyzw[1]),
+                                float(rel_xyzw[2]),
+                            ], dtype=float)
+                        else:
+                            # Fallback before first calibration: treat current pose as relative identity.
+                            marker_quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+                goal = ControlGoal(
+                    arm=hand,
+                    mode=ControlMode.POSITION_CONTROL,
+                    # Original telegrip style: relative translation + wrist angles only.
+                    target_position=relative_delta,
+                    target_orientation_quat=marker_quat_wxyz,
+                    wrist_roll_deg=None,
+                    wrist_flex_deg=None,
+                    metadata={
+                        "source": "vr_grip",
+                        "relative_position": True,
+                        "origin_position": controller.origin_position.copy(),
+                        "marker_grab_drag": True,
+                    }
+                )
+                await self.send_goal(goal)
+    
+    async def handle_grip_release(self, hand: str):
+        """Handle grip release for a controller."""
+        if hand == 'left':
+            controller = self.left_controller
+        elif hand == 'right':
+            controller = self.right_controller
+        else:
+            return
+        
+        if controller.grip_active:
+            controller.reset_grip()
+            
+            # Send idle goal to stop arm control
+            goal = ControlGoal(
+                arm=hand,
+                mode=ControlMode.IDLE,
+                metadata={"source": "vr_grip_release"}
+            )
+            await self.send_goal(goal)
+            
+            logger.info(f"🔓 {hand.upper()} grip released - arm control stopped")
+    
+    async def handle_trigger_release(self, hand: str):
+        """Handle trigger release for a controller."""
+        controller = self.left_controller if hand == 'left' else self.right_controller
+        
+        if controller.trigger_active:
+            controller.trigger_active = False
+            
+            # Trigger released -> open gripper.
+            goal = ControlGoal(
+                arm=hand,
+                gripper_closed=False,
+                metadata={"source": "vr_trigger_release"}
+            )
+            await self.send_goal(goal)
+            
+            logger.info(f"🤏 {hand.upper()} gripper OPENED (trigger released)")
+    
+    def euler_to_quaternion(self, euler_deg: Dict[str, float]) -> np.ndarray:
+        """Convert Euler angles in degrees to quaternion [x, y, z, w]."""
+        euler_rad = [math.radians(euler_deg['x']), math.radians(euler_deg['y']), math.radians(euler_deg['z'])]
+        rotation = R.from_euler('xyz', euler_rad)
+        return rotation.as_quat()
+    
+    def update_quaternion_rotation(self, controller: VRControllerState, current_euler: dict):
+        """Update quaternion-based rotation tracking."""
+        if not current_euler:
+            return
+        
+        # Convert current Euler to quaternion
+        current_quat = self.euler_to_quaternion(current_euler)
+        
+        # Store current quaternion for accumulated rotation calculation
+        controller.accumulated_rotation_quat = current_quat
+    
+    def update_quaternion_rotation_direct(self, controller: VRControllerState, current_quat: np.ndarray):
+        """Update quaternion-based rotation tracking using quaternion data directly."""
+        if current_quat is None:
+            return
+        
+        # Store current quaternion for accumulated rotation calculation
+        controller.accumulated_rotation_quat = current_quat
+    
+    def extract_roll_from_quaternion(self, current_quat: np.ndarray, origin_quat: np.ndarray) -> float:
+        """Extract roll rotation around Z-axis from relative quaternion rotation."""
+        if current_quat is None or origin_quat is None:
+            return 0.0
+        
+        try:
+            # Calculate relative rotation quaternion (from origin to current)
+            origin_rotation = R.from_quat(origin_quat)
+            current_rotation = R.from_quat(current_quat)
+            relative_rotation = current_rotation * origin_rotation.inv()
+            
+            # Project the relative rotation onto the Z-axis (roll)
+            # Get the rotation vector (axis-angle representation)
+            rotvec = relative_rotation.as_rotvec()
+            
+            # The Z-component of the rotation vector represents rotation around Z-axis (roll)
+            z_rotation_rad = rotvec[2]
+            z_rotation_deg = -np.degrees(z_rotation_rad)
+            
+            return z_rotation_deg
+        except Exception as e:
+            logger.warning(f"Error extracting roll from quaternion: {e}")
+            return 0.0
+    
+    def extract_pitch_from_quaternion(self, current_quat: np.ndarray, origin_quat: np.ndarray) -> float:
+        """Extract pitch rotation around X-axis from relative quaternion rotation."""
+        if current_quat is None or origin_quat is None:
+            return 0.0
+        
+        try:
+            # Calculate relative rotation quaternion (from origin to current)
+            origin_rotation = R.from_quat(origin_quat)
+            current_rotation = R.from_quat(current_quat)
+            relative_rotation = current_rotation * origin_rotation.inv()
+            
+            # Project the relative rotation onto the X-axis (pitch)
+            # Get the rotation vector (axis-angle representation)
+            rotvec = relative_rotation.as_rotvec()
+            
+            # The X-component of the rotation vector represents rotation around X-axis (pitch)
+            x_rotation_rad = rotvec[0]
+            x_rotation_deg = np.degrees(x_rotation_rad)
+            
+            return x_rotation_deg
+        except Exception as e:
+            logger.warning(f"Error extracting pitch from quaternion: {e}")
+            return 0.0 
