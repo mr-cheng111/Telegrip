@@ -64,6 +64,7 @@ def create_config_from_args(args) -> TelegripConfig:
     path_cfg = config_data.get("paths", {})
     gripper_cfg = config_data.get("gripper", {})
     ik_cfg = config_data.get("ik", {})
+    gnirehtet_cfg = config_data.get("gnirehtet", {})
 
     keyboard_cfg = control_cfg.get("keyboard", {})
     vr_cfg = control_cfg.get("vr", {})
@@ -108,6 +109,10 @@ def create_config_from_args(args) -> TelegripConfig:
     config.ik_position_error_threshold = float(ik_cfg.get("position_error_threshold", config.ik_position_error_threshold))
     config.ik_hysteresis_threshold = float(ik_cfg.get("hysteresis_threshold", config.ik_hysteresis_threshold))
     config.ik_movement_penalty_weight = float(ik_cfg.get("movement_penalty_weight", config.ik_movement_penalty_weight))
+    config.gnirehtet_enabled = bool(gnirehtet_cfg.get("enabled", config.gnirehtet_enabled))
+    config.gnirehtet_binary = str(gnirehtet_cfg.get("binary", config.gnirehtet_binary))
+    config.gnirehtet_mode = str(gnirehtet_cfg.get("mode", config.gnirehtet_mode))
+    config.gnirehtet_args = [str(arg) for arg in gnirehtet_cfg.get("args", config.gnirehtet_args or [])]
 
     if args.no_robot:
         config.enable_robot = False
@@ -184,6 +189,7 @@ async def main():
         logger.info(f"  VR: {'enabled' if config.enable_vr else 'disabled'}")
         logger.info(f"  Keyboard: {'enabled' if config.enable_keyboard else 'disabled'}")
         logger.info(f"  Auto-connect: {'enabled' if config.autoconnect else 'disabled'}")
+        logger.info(f"  Gnirehtet auto-start: {'enabled' if config.gnirehtet_enabled else 'disabled'}")
         logger.info(f"  HTTPS Port: {config.https_port}")
         logger.info(f"  WebSocket Port: {config.websocket_port}")
         logger.info(f"  Robot Ports: {config.follower_ports}")

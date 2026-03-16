@@ -6,6 +6,8 @@ import asyncio
 import logging
 import queue
 import threading
+import subprocess
+from typing import Optional
 
 from .config import TelegripConfig
 from .control_loop import ControlLoop
@@ -38,6 +40,56 @@ class TelegripSystem:
         self.tasks = []
         self.is_running = False
         self.main_loop = None
+        self.gnirehtet_process: Optional[subprocess.Popen] = None
+
+    def _start_gnirehtet(self):
+        """Start gnirehtet reverse tethering process if enabled."""
+        if not self.config.gnirehtet_enabled:
+            return
+
+        if self.gnirehtet_process and self.gnirehtet_process.poll() is None:
+            logger.info("gnirehtet is already running")
+            return
+
+        try:
+            from .utils import get_absolute_path, get_project_root
+
+            gnirehtet_path = get_absolute_path(self.config.gnirehtet_binary)
+            if not gnirehtet_path.exists():
+                logger.warning(f"gnirehtet binary not found: {gnirehtet_path}")
+                return
+
+            cmd = [str(gnirehtet_path), self.config.gnirehtet_mode] + (self.config.gnirehtet_args or [])
+            self.gnirehtet_process = subprocess.Popen(
+                cmd,
+                cwd=str(get_project_root()),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            logger.info(f"Started gnirehtet: {' '.join(cmd)} (pid={self.gnirehtet_process.pid})")
+        except Exception as e:
+            logger.error(f"Failed to start gnirehtet: {e}")
+
+    def _stop_gnirehtet(self):
+        """Stop gnirehtet process if running."""
+        if not self.gnirehtet_process:
+            return
+
+        if self.gnirehtet_process.poll() is not None:
+            self.gnirehtet_process = None
+            return
+
+        try:
+            self.gnirehtet_process.terminate()
+            self.gnirehtet_process.wait(timeout=3)
+            logger.info("Stopped gnirehtet process")
+        except subprocess.TimeoutExpired:
+            self.gnirehtet_process.kill()
+            logger.warning("gnirehtet did not stop in time, process killed")
+        except Exception as e:
+            logger.warning(f"Failed to stop gnirehtet process cleanly: {e}")
+        finally:
+            self.gnirehtet_process = None
 
     def add_control_command(self, action: str):
         """Add a control command to the queue for processing."""
@@ -162,6 +214,7 @@ class TelegripSystem:
         try:
             self.is_running = True
             self.main_loop = asyncio.get_event_loop()
+            self._start_gnirehtet()
 
             await self.https_server.start()
             await self.vr_server.start()
@@ -217,6 +270,7 @@ class TelegripSystem:
         """Stop all system components."""
         logger.info("Shutting down teleoperation system...")
         self.is_running = False
+        self._stop_gnirehtet()
 
         try:
             await asyncio.wait_for(self.vr_server.stop(), timeout=2.0)

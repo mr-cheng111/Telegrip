@@ -21,6 +21,12 @@ DEFAULT_CONFIG = {
         "websocket_port": 8442,
         "host_ip": "0.0.0.0"
     },
+    "gnirehtet": {
+        "enabled": False,
+        "binary": "gnirehtet-rust-linux64/gnirehtet",
+        "mode": "run",
+        "args": []
+    },
     "ssl": {
         "certfile": "cert.pem",
         "keyfile": "key.pem"
@@ -212,6 +218,12 @@ class TelegripConfig:
     https_port: int = HTTPS_PORT
     websocket_port: int = WEBSOCKET_PORT
     host_ip: str = HOST_IP
+
+    # Gnirehtet settings
+    gnirehtet_enabled: bool = bool(_config_data.get("gnirehtet", {}).get("enabled", False))
+    gnirehtet_binary: str = str(_config_data.get("gnirehtet", {}).get("binary", "gnirehtet-rust-linux64/gnirehtet"))
+    gnirehtet_mode: str = str(_config_data.get("gnirehtet", {}).get("mode", "run"))
+    gnirehtet_args: List[str] = None
     
     # SSL settings
     certfile: str = CERTFILE
@@ -260,6 +272,10 @@ class TelegripConfig:
     gripper_step: float = GRIPPER_STEP
     
     def __post_init__(self):
+        if self.gnirehtet_args is None:
+            cfg_args = _config_data.get("gnirehtet", {}).get("args", [])
+            self.gnirehtet_args = [str(arg) for arg in cfg_args] if isinstance(cfg_args, list) else []
+
         # Initialize follower_ports if not set
         if self.follower_ports is None:
             self.follower_ports = {

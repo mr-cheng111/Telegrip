@@ -16,6 +16,11 @@ control:
 gripper:
   closed_angle: 45.0
   open_angle: 0.0
+gnirehtet:
+  enabled: false
+  binary: gnirehtet-rust-linux64/gnirehtet
+  mode: run
+  args: []
 ik:
   use_reference_poses: true
   reference_poses_file: reference_poses_arm620.json

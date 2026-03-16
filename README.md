@@ -28,7 +28,35 @@ https://github.com/user-attachments/assets/e21168b5-e9b4-4c83-ab4d-a15cb470d11b
 1. **Robot Hardware**: One or two SO100 arm robot with USB-serial connections
 2. **Python Environment**: Python 3.8+ with required packages
 3. **VR Setup** (optional): Meta Quest or other headset with WebXR support (no app installation needed!)
+4. **ROS2 (for real robot control)**: ROS2 Humble + `rclpy`, `sensor_msgs`, `std_msgs`
 
+### Dependency List
+
+Core Python libraries used by telegrip:
+
+- `numpy`
+- `torch`
+- `scipy`
+- `mujoco>=3.0.0`
+- `websockets`
+- `pynput`
+- `pyyaml`
+
+ROS2 libraries used for hardware control:
+
+- `rclpy`
+- `sensor_msgs`
+- `std_msgs`
+
+Optional networking helper:
+
+- `gnirehtet` (for Android reverse tethering / network sharing)
+
+If you cloned with submodules, initialize them:
+
+```bash
+git submodule update --init --recursive
+```
 
 
 
@@ -65,6 +93,34 @@ Run the complete teleoperation system:
 ```bash
 telegrip
 ```
+
+### Recommended Startup Order
+
+To avoid connection and environment issues, start components in this order:
+
+1. **Open Terminal A**: source ROS2 and your workspace
+```bash
+source /opt/ros/humble/setup.bash
+# Optional if you use your own workspace:
+source ~/Documents/arm_teach/install/setup.bash
+```
+
+2. **(Optional) Open Terminal B**: start network sharing helper if needed
+```bash
+./gnirehtet-rust-linux64/gnirehtet run
+```
+
+3. **Open Terminal A**: start telegrip from project root
+```bash
+telegrip --log-level info
+```
+
+4. **PC browser first**: open `https://<host-ip>:8443` and check status indicators are green
+
+5. **VR headset browser second**: open the same `https://<host-ip>:8443`
+
+6. **In Web UI**: click `Connect Robot`, then start keyboard/VR control
+
 The first time you might be asked to complete pose calibrations as shown in [this guide](https://github.com/huggingface/lerobot/blob/8cfab3882480bdde38e42d93a9752de5ed42cae2/examples/10_use_so100.md#e-calibrate). Calibration files are stored in `.cache/calibration/so100/arm_name.json`. When calibration files are found, you will be greeted with a message like 
 ```bash
 🤖 telegrip starting...
@@ -232,6 +288,8 @@ class ControlGoal:
 - Check USB-serial device permissions: `sudo chmod 666 /dev/ttySO100*`
 - Verify port names match actual devices
 - Try running with `--no-robot` for testing
+- Ensure you are using the system `telegrip` launcher (`#!/usr/bin/python3`), not a conflicting Conda one
+- Ensure ROS2 env is sourced before starting telegrip (`source /opt/ros/humble/setup.bash`)
 
 **VR Controllers Not Connecting**:
 - Ensure Quest and robot are on same network
