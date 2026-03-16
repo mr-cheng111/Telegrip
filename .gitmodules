@@ -1,0 +1,4 @@
+[submodule "mink"]
+	path = mink
+	url = https://github.com/mr-cheng111/mink.git
+	branch = main
