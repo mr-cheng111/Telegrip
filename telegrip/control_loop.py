@@ -97,9 +97,16 @@ class ControlLoop:
         # +X(right) -> -Y, +/-Y(front/back) -> +/-X, Z unchanged.
         self._vr_delta_to_base_quat = self._quat_from_euler_xyz_deg(0.0, 0.0, -90.0)
         # Controller-delta -> target-delta orientation frame mapping:
-        # X_hand -> X_target, Y_hand -> -Z_target, Z_hand -> Y_target
-        # Equivalent to Rx(-90 deg).
-        self._controller_delta_to_target_quat = self._quat_from_euler_xyz_deg(-90.0, 0.0, 0.0)
+        # X_hand -> X_target, Y_hand -> -Y_target, Z_hand -> Z_target
+        # 该映射矩阵 S（列向量为手柄基轴在目标系中的表示）:
+        #   S = diag(1, -1, 1)
+        # 姿态增量采用基变换公式:
+        #   R_delta_target = S * R_delta_hand * S^T
+        # 公式来源: 同一旋转在两套坐标基下的相似变换（change of basis）。
+        self._controller_delta_to_target_axis_map = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=float,
+        )
 
     
     def setup(self) -> bool:
@@ -188,9 +195,14 @@ class ControlLoop:
             else:
                 # Keep startup posture consistent with mink/examples/arm_arm620_dual_unified_base.py.
                 if use_unified_base_scene:
-                    initial_pose_deg = np.array([0.0, -30.0, -60.0, 0.0, 0.0, 0.0], dtype=float)
-                    self.visualizer.set_initial_arm_pose_deg(initial_pose_deg, initial_pose_deg)
-                    logger.info("Applied unified-base initial pose: [0, -30, -60, 0, 0, 0] deg")
+                    # 左右臂初始角互为相反数。
+                    right_initial_pose_deg = np.array([-90.0, -30.0, -90.0, -90.0, -90.0, 30.0], dtype=float)
+                    left_initial_pose_deg =  np.array([90.0, 30.0, 90.0, 90.0, 90.0, 150.0], dtype=float)
+                    self.visualizer.set_initial_arm_pose_deg(left_initial_pose_deg, right_initial_pose_deg)
+                    logger.info(
+                        "Applied unified-base initial pose: "
+                        "left=[90, 30, 90, 90, 90, 0] deg, right=[-90, -30, -90, -90, -90, 0] deg"
+                    )
 
                 # Match physical progression to control period.
                 # Example scenes use timestep=0.001s while control loop is 200Hz (0.005s),
@@ -449,6 +461,23 @@ class ControlLoop:
             y = (m12 + m21) / s
             z = 0.25 * s
         return ControlLoop._quat_normalize_wxyz(np.array([w, x, y, z], dtype=float))
+
+    @staticmethod
+    def _quat_to_rotation_matrix_wxyz(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
+        qn = ControlLoop._quat_normalize_wxyz(q)
+        w, x, y, z = qn
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        return np.array(
+            [
+                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+            ],
+            dtype=float,
+        )
 
     @staticmethod
     def _quat_from_euler_xyz_deg(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
@@ -732,19 +761,20 @@ class ControlLoop:
                             # "Relative to initialization" behavior:
                             # 1) q_mapped is controller local delta (from init calibration).
                             # 2) Map controller-delta frame into target-delta frame.
-                            #    q_delta_target = C * q_delta_controller * C^{-1}
+                            #    R_delta_target = S * R_delta_controller * S^T
                             # 3) Apply delta on target's initialized orientation in local order:
                             #    q_target = q_target_init * q_delta_target
-                            c = self._controller_delta_to_target_quat
-                            q_delta_target = self._quat_multiply_wxyz(
-                                self._quat_multiply_wxyz(c, q_mapped),
-                                self._quat_inverse_wxyz(c),
+                            R_delta_hand = self._quat_to_rotation_matrix_wxyz(q_mapped)
+                            S = self._controller_delta_to_target_axis_map
+                            R_delta_target = S @ R_delta_hand @ S.T
+                            q_delta_target = self._quat_from_rotation_matrix_wxyz(
+                                R_delta_target
                             )
-                            q_init = (
-                                arm_state.initial_target_orientation_quat
-                                if arm_state.initial_target_orientation_quat is not None
-                                else arm_state.origin_target_orientation_quat
-                            )
+                            # 固定姿态基准: 先绕 X 轴 +90°，再绕 Z 轴 -90°。
+                            # 本函数内部构造为 R = Rz(rz) * Ry(ry) * Rx(rx)，
+                            # 因此这里写 (rx=90, ry=0, rz=-90) 即可对应上述顺序。
+                            q_init = self._quat_from_euler_xyz_deg(90.0, 0.0, -90.0)
+
                             q_out = self._quat_multiply_wxyz(
                                 q_init,
                                 q_delta_target,

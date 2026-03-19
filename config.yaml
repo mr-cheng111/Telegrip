@@ -5,9 +5,27 @@ control:
     gripper_step: 10.0
     pos_step: 0.01
   mink:
+    # IK 积分步长（单位：秒）。越大单步动作越激进，越小越平滑。
+    dt: 0.005
     enabled: true
     end_effector_site: tools_link
+    # 任务层 LM 阻尼（无量纲）。增大可提高奇异位姿附近稳定性，但会降低灵敏度。
+    lm_damping: 1.0
+    # 每个控制周期内的 IK 最大迭代次数。越大收敛更充分，但计算开销更高。
+    max_iters: 20
     mujoco_scene: mink/examples/arm620/scene_dual_unified_base.xml
+    # 末端姿态误差权重（无量纲）。越大越优先“对准方向”。
+    orientation_cost: 5.0
+    # 姿态收敛阈值（单位：弧度，旋转向量范数）。越小要求越严格。
+    orientation_error_threshold: 0.001
+    # 末端位置误差权重（无量纲）。越大越优先“到目标点”。
+    position_cost: 1.0
+    # 位置收敛阈值（单位：米）。越小要求越严格。
+    position_error_threshold: 0.0001
+    # 关节姿态保持权重（无量纲）。越大越抑制关节剧烈变化，动作更稳但更“钝”。
+    posture_cost: 0.01
+    # 求解器正则阻尼（无量纲）。增大可抑制抖动与噪声放大，但跟踪会变慢。
+    solve_damping: 0.001
   pybullet:
     enabled: true
   use_mink: true
@@ -15,15 +33,20 @@ control:
     enabled: true
     orientation_reference_quat_xyzw:
       left:
-      - 0.6133185704817465
-      - 0.03638127929831347
-      - -0.015506442979743205
-      - 0.7888449048101668
+      - 0
+      - 0
+      - 0
+      - 1
       right:
-      - 0.6238796148995309
-      - -0.07605639858459375
-      - 0.11194518175019069
-      - 0.7697128858412539
+      - 0
+      - 0
+      - 0
+      - 1
+gnirehtet:
+  args: []
+  binary: gnirehtet-rust-linux64/gnirehtet
+  enabled: false
+  mode: run
 gripper:
   closed_angle: 45.0
   open_angle: 0.0

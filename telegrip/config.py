@@ -52,6 +52,15 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "mujoco_scene": "mink/examples/arm620/scene.xml",
             "end_effector_site": "tools_link",
+            "position_cost": 1.0,
+            "orientation_cost": 1.0,
+            "posture_cost": 0.01,
+            "lm_damping": 1.0,
+            "solve_damping": 0.001,
+            "dt": 0.005,
+            "max_iters": 20,
+            "position_error_threshold": 1e-4,
+            "orientation_error_threshold": 1e-3,
         },
         "keyboard": {
             "enabled": True,
@@ -155,6 +164,15 @@ GRIPPER_STEP = _config_data["control"]["keyboard"]["gripper_step"]
 USE_MINK = _config_data["control"].get("use_mink", True)
 MINK_MUJOCO_SCENE = _config_data["control"].get("mink", {}).get("mujoco_scene", "mink/examples/arm620/scene.xml")
 MINK_END_EFFECTOR_SITE = _config_data["control"].get("mink", {}).get("end_effector_site", "tools_link")
+MINK_POSITION_COST = float(_config_data["control"].get("mink", {}).get("position_cost", 1.0))
+MINK_ORIENTATION_COST = float(_config_data["control"].get("mink", {}).get("orientation_cost", 1.0))
+MINK_POSTURE_COST = float(_config_data["control"].get("mink", {}).get("posture_cost", 0.01))
+MINK_LM_DAMPING = float(_config_data["control"].get("mink", {}).get("lm_damping", 1.0))
+MINK_SOLVE_DAMPING = float(_config_data["control"].get("mink", {}).get("solve_damping", 1e-3))
+MINK_DT = float(_config_data["control"].get("mink", {}).get("dt", 0.005))
+MINK_MAX_ITERS = int(_config_data["control"].get("mink", {}).get("max_iters", 20))
+MINK_POS_THRESHOLD = float(_config_data["control"].get("mink", {}).get("position_error_threshold", 1e-4))
+MINK_ORI_THRESHOLD = float(_config_data["control"].get("mink", {}).get("orientation_error_threshold", 1e-3))
 
 URDF_PATH = _config_data["paths"]["urdf_path"]
 
@@ -250,6 +268,15 @@ class TelegripConfig:
     use_mink: bool = USE_MINK
     mink_mujoco_scene: str = MINK_MUJOCO_SCENE
     end_effector_site: str = MINK_END_EFFECTOR_SITE
+    mink_position_cost: float = MINK_POSITION_COST
+    mink_orientation_cost: float = MINK_ORIENTATION_COST
+    mink_posture_cost: float = MINK_POSTURE_COST
+    mink_lm_damping: float = MINK_LM_DAMPING
+    mink_solve_damping: float = MINK_SOLVE_DAMPING
+    mink_dt: float = MINK_DT
+    mink_max_iters: int = MINK_MAX_ITERS
+    mink_position_error_threshold: float = MINK_POS_THRESHOLD
+    mink_orientation_error_threshold: float = MINK_ORI_THRESHOLD
     
     # Paths
     urdf_path: str = URDF_PATH

@@ -19,7 +19,12 @@ class MinkIKSolver:
     
     def __init__(self, xml_path: str, end_effector_site: str = "attachment_site",
                  joint_names: list = None, joint_limits_min_deg: np.ndarray = None,
-                 joint_limits_max_deg: np.ndarray = None, num_ik_joints: int = 6):
+                 joint_limits_max_deg: np.ndarray = None, num_ik_joints: int = 6,
+                 position_cost: float = 1.0, orientation_cost: float = 1.0,
+                 posture_cost: float = 1e-2, lm_damping: float = 1.0,
+                 solve_damping: float = 1e-3, dt: float = 0.005,
+                 max_iters: int = 20, pos_threshold: float = 1e-4,
+                 ori_threshold: float = 1e-3):
         """
         Initialize mink IK solver.
         
@@ -62,21 +67,22 @@ class MinkIKSolver:
         self.end_effector_task = mink.FrameTask(
             frame_name=end_effector_site,
             frame_type="site",
-            position_cost=1.0,
-            orientation_cost=1.0,
-            lm_damping=1.0,
+            position_cost=float(position_cost),
+            orientation_cost=float(orientation_cost),
+            lm_damping=float(lm_damping),
         )
         
-        self.posture_task = mink.PostureTask(model=self.model, cost=1e-2)
+        self.posture_task = mink.PostureTask(model=self.model, cost=float(posture_cost))
         
         self.tasks: List = [self.end_effector_task, self.posture_task]
         self._mocap_ids = {}
         
         self.solver = "daqp"
-        self.dt = 0.005
-        self.max_iters = 20
-        self.pos_threshold = 1e-4
-        self.ori_threshold = 1e-3
+        self.dt = float(dt)
+        self.max_iters = int(max_iters)
+        self.pos_threshold = float(pos_threshold)
+        self.ori_threshold = float(ori_threshold)
+        self.solve_damping = float(solve_damping)
         
         logger.info(f"MinkIKSolver initialized with model: {self.xml_path.name}")
     
@@ -140,7 +146,7 @@ class MinkIKSolver:
                 self.tasks, 
                 self.dt, 
                 self.solver, 
-                damping=1e-3
+                damping=self.solve_damping
             )
             self.configuration.integrate_inplace(vel, self.dt)
             

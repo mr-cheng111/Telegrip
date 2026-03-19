@@ -152,8 +152,8 @@ class RobotInterface:
         self.max_arm_errors = 3
         self.max_general_errors = 8
         
-        self.initial_left_arm = np.array([0, -100, 100, 60, 0, 0])
-        self.initial_right_arm = np.array([0, -100, 100, 60, 0, 0])
+        self.initial_left_arm = np.array([90, 30, 90, 90, 90, 0])
+        self.initial_right_arm = np.array([-90, -30, -90, -90, -90, 0])
     
     def connect(self) -> bool:
         """Connect to robot via ROS2."""
@@ -321,7 +321,16 @@ class RobotInterface:
                     joint_names=jnames,
                     joint_limits_min_deg=self.joint_limits_min_deg,
                     joint_limits_max_deg=self.joint_limits_max_deg,
-                    num_ik_joints=NUM_JOINTS
+                    num_ik_joints=NUM_JOINTS,
+                    position_cost=self.config.mink_position_cost,
+                    orientation_cost=self.config.mink_orientation_cost,
+                    posture_cost=self.config.mink_posture_cost,
+                    lm_damping=self.config.mink_lm_damping,
+                    solve_damping=self.config.mink_solve_damping,
+                    dt=self.config.mink_dt,
+                    max_iters=self.config.mink_max_iters,
+                    pos_threshold=self.config.mink_position_error_threshold,
+                    ori_threshold=self.config.mink_orientation_error_threshold,
                 )
                 
                 self.fk_solvers[arm] = MinkForwardKinematics(
