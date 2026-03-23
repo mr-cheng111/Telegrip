@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools >= 61.0", "wheel"]
+requires = ["setuptools >= 64.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -39,5 +39,5 @@ telegrip = "telegrip.main:main_cli"
 Homepage = "https://github.com/your-username/vr_so100_teleoperation"
 Repository = "https://github.com/your-username/vr_so100_teleoperation"
 
-[tool.setuptools]
-packages = ["telegrip"] 
+[tool.setuptools.packages.find]
+include = ["telegrip*"]

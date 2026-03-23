@@ -5,7 +5,9 @@ telegrip/__init__.py
 telegrip/__main__.py
 telegrip/config.py
 telegrip/control_loop.py
+telegrip/http_api.py
 telegrip/main.py
+telegrip/runtime.py
 telegrip/utils.py
 telegrip.egg-info/PKG-INFO
 telegrip.egg-info/SOURCES.txt
