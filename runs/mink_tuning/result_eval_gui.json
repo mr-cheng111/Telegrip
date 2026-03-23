@@ -1,0 +1,43 @@
+{
+  "tag": "eval_gui",
+  "scene_xml": "/home/tower/Downloads/telegrip/mink/examples/arm620/_tmp_dual_unified_saved.xml",
+  "arm": "left",
+  "seed": 42,
+  "use_gui": true,
+  "eval_config": {
+    "arm": "left",
+    "seed": 42,
+    "episodes": 4,
+    "episode_seconds": 5.0,
+    "control_hz": 200.0,
+    "target_hold_seconds": 0.5,
+    "target_radius": 0.1,
+    "z_min": 0.1,
+    "z_max": 1.0
+  },
+  "params": {
+    "position_cost": 1.0,
+    "orientation_cost": 5.0,
+    "posture_cost": 0.01,
+    "lm_damping": 1.0,
+    "solve_damping": 0.001,
+    "ik_dt": 0.005,
+    "max_iters": 20,
+    "pos_threshold": 0.0001,
+    "ori_threshold": 0.001,
+    "kp_scale": 1.0,
+    "kd_scale": 1.0
+  },
+  "metrics": {
+    "rmse_pos_m": 0.2673025403523575,
+    "p95_pos_m": 0.3435122665360676,
+    "mean_track_speed_mps": 0.08069477718865783,
+    "mean_ee_speed_mps": 0.10886403842737906,
+    "qvel_jitter": 0.54697658156055,
+    "tau_jitter": 2.476435622741562,
+    "objective": 474.15768384735463,
+    "score": 0.2104564514042989
+  },
+  "timestamp": 1773976027,
+  "trajectory_csv": "/home/tower/Downloads/telegrip/runs/mink_tuning/trajectory_eval_gui.csv"
+}
