@@ -143,11 +143,12 @@ Options:
   --no-vr           Disable VR WebSocket server
   --no-keyboard     Disable keyboard input
   --autoconnect     Automatically connect to robot motors on startup
-  --log-level LEVEL Set logging level: debug, info, warning, error, critical (default: warning)
+  --log-level LEVEL Set logging level: debug, info, warning, error, critical (default: info)
   --https-port PORT HTTPS server port (default: 8443)
   --ws-port PORT    WebSocket server port (default: 8442)
   --host HOST       Host IP address (default: 0.0.0.0)
   --urdf PATH       Path to robot URDF file
+  --config FILE     Path to config file (default: config.yaml)
   --left-port PORT  Left arm serial port (default: /dev/ttySO100red)
   --right-port PORT Right arm serial port (default: /dev/ttySO100leader)
 ```

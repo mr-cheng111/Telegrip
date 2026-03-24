@@ -39,7 +39,7 @@ control:
     enabled: false
 ```
 
-#### config_arm620.yaml (ARM620专用)
+#### config.yaml (ARM620专用)
 ```yaml
 control:
   use_mink: true
@@ -81,7 +81,7 @@ pip install -e .
 
 **ARM620 VR遥操作**:
 ```bash
-python examples/vr_teleoperate_arm620.py --config config_arm620.yaml --no-robot
+python examples/vr_teleoperate_arm620.py --config config.yaml --no-robot
 ```
 
 **SO100 (默认)**:

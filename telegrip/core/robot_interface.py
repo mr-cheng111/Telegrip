@@ -7,7 +7,7 @@ import numpy as np
 import time
 import logging
 import mujoco
-from typing import Optional, Dict, TYPE_CHECKING
+from typing import Optional, Dict, TYPE_CHECKING, Tuple
 from pathlib import Path
 
 try:
@@ -25,7 +25,7 @@ from ..config import (
     TelegripConfig, NUM_JOINTS, JOINT_NAMES,
     GRIPPER_OPEN_ANGLE, GRIPPER_CLOSED_ANGLE
 )
-from .mink_kinematics import MinkIKSolver, MinkForwardKinematics
+from .mink_kinematics import MinkIKSolver, MinkDualIKSolver, MinkForwardKinematics
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,9 @@ class RobotInterface:
         
         self.fk_solvers = {'left': None, 'right': None}
         self.ik_solvers = {'left': None, 'right': None}
+        self.dual_ik_solver = None
+        self.arm_sites = {'left': None, 'right': None}
+        self.arm_joint_names = {'left': None, 'right': None}
         self.mocap_targets = {'left': None, 'right': None}
         # If True, keep legacy behavior where channel-6 is treated as gripper.
         # For ARM620 scenes, gripper is a separate actuator and this must be False.
@@ -261,6 +264,7 @@ class RobotInterface:
                 "left": _resolve_arm_site("left"),
                 "right": _resolve_arm_site("right"),
             }
+            self.arm_sites = arm_site.copy()
 
             dual_namespaced = arm_site["left"] != arm_site["right"]
             self.mocap_targets = {
@@ -284,24 +288,37 @@ class RobotInterface:
                         "right": joint_names[:NUM_JOINTS],
                     }
 
-            # Read limits from left-arm controlled joints for global safety clamp.
-            for i, jname in enumerate(arm_joint_names["left"][:NUM_JOINTS]):
-                try:
-                    jid = model.joint(jname).id
-                    if model.jnt_limited[jid]:
-                        lower, upper = model.jnt_range[jid]
-                        self.joint_limits_min_deg[i] = np.rad2deg(lower)
-                        self.joint_limits_max_deg[i] = np.rad2deg(upper)
-                except Exception:
-                    continue
+            self.arm_joint_names = {
+                "left": list(arm_joint_names["left"][:NUM_JOINTS]),
+                "right": list(arm_joint_names["right"][:NUM_JOINTS]),
+            }
 
-            # Create IK and FK solvers for both arms
+            arm_limits_min_deg = {
+                "left": np.full(NUM_JOINTS, -180.0, dtype=float),
+                "right": np.full(NUM_JOINTS, -180.0, dtype=float),
+            }
+            arm_limits_max_deg = {
+                "left": np.full(NUM_JOINTS, 180.0, dtype=float),
+                "right": np.full(NUM_JOINTS, 180.0, dtype=float),
+            }
+
+            for arm in ('left', 'right'):
+                for i, jname in enumerate(self.arm_joint_names[arm]):
+                    try:
+                        jid = model.joint(jname).id
+                        if model.jnt_limited[jid]:
+                            lower, upper = model.jnt_range[jid]
+                            arm_limits_min_deg[arm][i] = np.rad2deg(lower)
+                            arm_limits_max_deg[arm][i] = np.rad2deg(upper)
+                    except Exception:
+                        continue
+
+            # 保持历史行为：安全夹紧沿用左臂限制。
+            self.joint_limits_min_deg = arm_limits_min_deg["left"].copy()
+            self.joint_limits_max_deg = arm_limits_max_deg["left"].copy()
+
+            # Detect whether this scene has a separate gripper actuator.
             for arm in ['left', 'right']:
-                jnames = arm_joint_names[arm]
-
-                # Detect whether this scene has a separate gripper actuator.
-                # If it does, joint6 should remain an arm joint (do not overwrite it
-                # with gripper command values).
                 self.gripper_on_joint6[arm] = True
                 for act_name in (
                     f"{arm}/robotiq_2f85_v4_actuator",
@@ -315,13 +332,21 @@ class RobotInterface:
                     except Exception:
                         continue
 
-                self.ik_solvers[arm] = MinkIKSolver(
+            self.dual_ik_solver = None
+            self.ik_solvers = {'left': None, 'right': None}
+
+            if dual_namespaced:
+                # 双臂联合模式：一个Mink配置内同时优化左右臂。
+                self.dual_ik_solver = MinkDualIKSolver(
                     xml_path=str(scene_path),
-                    end_effector_site=arm_site[arm],
-                    joint_names=jnames,
-                    joint_limits_min_deg=self.joint_limits_min_deg,
-                    joint_limits_max_deg=self.joint_limits_max_deg,
-                    num_ik_joints=NUM_JOINTS,
+                    left_end_effector_site=arm_site["left"],
+                    right_end_effector_site=arm_site["right"],
+                    left_joint_names=self.arm_joint_names["left"],
+                    right_joint_names=self.arm_joint_names["right"],
+                    left_joint_limits_min_deg=arm_limits_min_deg["left"],
+                    left_joint_limits_max_deg=arm_limits_max_deg["left"],
+                    right_joint_limits_min_deg=arm_limits_min_deg["right"],
+                    right_joint_limits_max_deg=arm_limits_max_deg["right"],
                     position_cost=self.config.mink_position_cost,
                     orientation_cost=self.config.mink_orientation_cost,
                     posture_cost=self.config.mink_posture_cost,
@@ -332,15 +357,38 @@ class RobotInterface:
                     pos_threshold=self.config.mink_position_error_threshold,
                     ori_threshold=self.config.mink_orientation_error_threshold,
                 )
-                
+            else:
+                for arm in ['left', 'right']:
+                    jnames = self.arm_joint_names[arm]
+                    self.ik_solvers[arm] = MinkIKSolver(
+                        xml_path=str(scene_path),
+                        end_effector_site=arm_site[arm],
+                        joint_names=jnames,
+                        joint_limits_min_deg=self.joint_limits_min_deg,
+                        joint_limits_max_deg=self.joint_limits_max_deg,
+                        num_ik_joints=NUM_JOINTS,
+                        position_cost=self.config.mink_position_cost,
+                        orientation_cost=self.config.mink_orientation_cost,
+                        posture_cost=self.config.mink_posture_cost,
+                        lm_damping=self.config.mink_lm_damping,
+                        solve_damping=self.config.mink_solve_damping,
+                        dt=self.config.mink_dt,
+                        max_iters=self.config.mink_max_iters,
+                        pos_threshold=self.config.mink_position_error_threshold,
+                        ori_threshold=self.config.mink_orientation_error_threshold,
+                    )
+
+            for arm in ['left', 'right']:
+                jnames = self.arm_joint_names[arm]
                 self.fk_solvers[arm] = MinkForwardKinematics(
                     xml_path=str(scene_path),
                     end_effector_site=arm_site[arm],
                     num_joints=NUM_JOINTS,
                     joint_names=jnames,
                 )
-            
+
             logger.info(f"✓ Mink kinematics solvers initialized for both arms")
+            logger.info(f"  Joint IK mode: {'shared dual solver' if self.dual_ik_solver is not None else 'per-arm solvers'}")
             logger.info(f"  Scene: {scene_path.name}")
             logger.info(f"  End effectors: left={arm_site['left']} right={arm_site['right']}")
             return True
@@ -364,7 +412,27 @@ class RobotInterface:
         """Solve inverse kinematics using Mink."""
         # Match arm_arm620_dual pattern: seed IK with current measured/simulated state.
         current_angles = self.get_actual_arm_angles(arm)
-        
+
+        if self.dual_ik_solver is not None:
+            other_arm = "right" if arm == "left" else "left"
+            other_pos = self.get_current_end_effector_position(other_arm)
+            other_ori = None
+            l_pos = target_position if arm == "left" else other_pos
+            r_pos = target_position if arm == "right" else other_pos
+            l_ori = target_orientation if arm == "left" else other_ori
+            r_ori = target_orientation if arm == "right" else other_ori
+            l_sol, r_sol = self.dual_ik_solver.solve(
+                left_target_position=l_pos,
+                right_target_position=r_pos,
+                left_target_orientation_quat=l_ori,
+                right_target_orientation_quat=r_ori,
+                current_left_angles_deg=self.get_actual_arm_angles("left"),
+                current_right_angles_deg=self.get_actual_arm_angles("right"),
+                left_mocap_name=self.mocap_targets.get("left"),
+                right_mocap_name=self.mocap_targets.get("right"),
+            )
+            return l_sol if arm == "left" else r_sol
+
         if self.ik_solvers[arm]:
             return self.ik_solvers[arm].solve(
                 target_position,
@@ -374,6 +442,30 @@ class RobotInterface:
             )
         else:
             return current_angles[:NUM_JOINTS]
+
+    def solve_dual_ik(
+        self,
+        left_target_position: np.ndarray,
+        right_target_position: np.ndarray,
+        left_target_orientation: Optional[np.ndarray] = None,
+        right_target_orientation: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Solve dual-arm IK in one shared Mink optimization step."""
+        if self.dual_ik_solver is not None:
+            return self.dual_ik_solver.solve(
+                left_target_position=left_target_position,
+                right_target_position=right_target_position,
+                left_target_orientation_quat=left_target_orientation,
+                right_target_orientation_quat=right_target_orientation,
+                current_left_angles_deg=self.get_actual_arm_angles("left"),
+                current_right_angles_deg=self.get_actual_arm_angles("right"),
+                left_mocap_name=self.mocap_targets.get("left"),
+                right_mocap_name=self.mocap_targets.get("right"),
+            )
+
+        left_solution = self.solve_ik("left", left_target_position, left_target_orientation)
+        right_solution = self.solve_ik("right", right_target_position, right_target_orientation)
+        return left_solution, right_solution
     
     def clamp_joint_angles(self, joint_angles: np.ndarray) -> np.ndarray:
         """Clamp joint angles to safe limits."""

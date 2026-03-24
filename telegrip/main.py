@@ -45,7 +45,7 @@ def parse_arguments():
     parser.add_argument("--key", default=None, help="Path to SSL private key")
 
     # Robot settings
-    parser.add_argument("--config", default="config_arm620.yaml", help="Path to config file")
+    parser.add_argument("--config", default="config.yaml", help="Path to config file")
     parser.add_argument("--left-port", help="Left arm serial port (overrides config file)")
     parser.add_argument("--right-port", help="Right arm serial port (overrides config file)")
 

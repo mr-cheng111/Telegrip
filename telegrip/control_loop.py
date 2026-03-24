@@ -838,6 +838,11 @@ class ControlLoop:
         if not self.robot_interface or not self.visualizer:
             return
 
+        ik_requests = {
+            "left": None,
+            "right": None,
+        }
+
         for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
             target_name = f"{arm_name}_target"
             goal_name = f"{arm_name}_goal"
@@ -894,17 +899,12 @@ class ControlLoop:
                 current_ee = self._get_current_ee_position(arm_name)
                 ik_target = current_ee + IK_TARGET_SMOOTHING * (ik_target - current_ee)
 
-                # 3) Solve IK and update commanded joint state.
-                ik_solution = self.robot_interface.solve_ik(arm_name, ik_target, ik_target_quat)
-                current_gripper = self.robot_interface.get_arm_angles(arm_name)[GRIPPER_INDEX]
-                self.robot_interface.update_arm_angles(
-                    arm_name,
-                    ik_solution,
-                    arm_state.current_wrist_flex,
-                    arm_state.current_wrist_roll,
-                    current_gripper,
-                    wrist_override=(arm_state.target_orientation_quat is None),
-                )
+                # 3) 收集双臂IK请求，统一交给共享Mink求解器。
+                ik_requests[arm_name] = {
+                    "target": ik_target,
+                    "target_quat": ik_target_quat,
+                    "wrist_override": (arm_state.target_orientation_quat is None),
+                }
 
             # 4) Marker/goal visibility policy.
             if arm_state.mode == ControlMode.POSITION_CONTROL:
@@ -923,6 +923,45 @@ class ControlLoop:
             actual_pos = self._get_current_ee_position(arm_name)
             actual_quat = self._get_current_ee_orientation(arm_name)
             self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
+
+        # 4.5) 双臂一次联合IK求解（与 arm_arm620_dual 示例一致）。
+        if ik_requests["left"] is not None or ik_requests["right"] is not None:
+            left_req = ik_requests["left"]
+            right_req = ik_requests["right"]
+
+            left_target = left_req["target"] if left_req is not None else self._get_current_ee_position("left")
+            right_target = right_req["target"] if right_req is not None else self._get_current_ee_position("right")
+            left_target_quat = left_req["target_quat"] if left_req is not None else None
+            right_target_quat = right_req["target_quat"] if right_req is not None else None
+
+            left_solution, right_solution = self.robot_interface.solve_dual_ik(
+                left_target_position=left_target,
+                right_target_position=right_target,
+                left_target_orientation=left_target_quat,
+                right_target_orientation=right_target_quat,
+            )
+
+            if left_req is not None:
+                left_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
+                self.robot_interface.update_arm_angles(
+                    "left",
+                    left_solution,
+                    self.left_arm.current_wrist_flex,
+                    self.left_arm.current_wrist_roll,
+                    left_gripper,
+                    wrist_override=left_req["wrist_override"],
+                )
+
+            if right_req is not None:
+                right_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
+                self.robot_interface.update_arm_angles(
+                    "right",
+                    right_solution,
+                    self.right_arm.current_wrist_flex,
+                    self.right_arm.current_wrist_roll,
+                    right_gripper,
+                    wrist_override=right_req["wrist_override"],
+                )
 
         # 5) Push commanded targets into simulation + step once.
         if self.config.require_state_feedback:
@@ -961,89 +1000,100 @@ class ControlLoop:
             if self.robot_interface.is_connected and self.robot_interface.is_engaged:
                 self.robot_interface.send_command()
             return
-        
-        # Update left arm - compute IK and update angles even in simulation-only mode
-        left_drag_target = None
-        if self.visualizer:
-            left_drag_target = self.visualizer.get_mocap_position("left_target")
 
-        left_idle_drag = False
-        if self.left_arm.mode == ControlMode.IDLE and left_drag_target is not None:
-            prev = self.left_arm.last_mocap_target_position
-            left_idle_drag = prev is None or np.linalg.norm(left_drag_target - prev) > 1e-5
+        ik_requests = {
+            "left": None,
+            "right": None,
+        }
 
-        if ((self.left_arm.mode == ControlMode.POSITION_CONTROL and self.left_arm.target_position is not None)
-            or left_idle_drag):
-            # Match arm_arm620_dual style: use mocap marker as IK target source of truth.
-            ik_target = self.left_arm.target_position if self.left_arm.target_position is not None else left_drag_target
+        for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
+            target_name = f"{arm_name}_target"
+
+            drag_target = self.visualizer.get_mocap_position(target_name) if self.visualizer else None
+
+            drag_active = False
+            if arm_state.mode == ControlMode.IDLE and drag_target is not None:
+                prev = arm_state.last_mocap_target_position
+                drag_active = prev is None or np.linalg.norm(drag_target - prev) > 1e-5
+
+            should_solve = (
+                (arm_state.mode == ControlMode.POSITION_CONTROL and arm_state.target_position is not None)
+                or drag_active
+            )
+
+            if not should_solve:
+                continue
+
+            ik_target = arm_state.target_position if arm_state.target_position is not None else drag_target
+            ik_target_quat = arm_state.target_orientation_quat
+
             if self.visualizer:
-                # In position-control mode, command marker from input stream.
-                # In idle mode, allow user drag in viewer (do not overwrite marker).
-                if self.left_arm.mode == ControlMode.POSITION_CONTROL:
+                if arm_state.mode == ControlMode.POSITION_CONTROL:
                     self.visualizer.update_marker_position(
-                        "left_target", ik_target, self.left_arm.target_orientation_quat
+                        target_name, ik_target, arm_state.target_orientation_quat
                     )
-                mocap_pos = self.visualizer.get_mocap_position("left_target")
+                mocap_pos = self.visualizer.get_mocap_position(target_name)
                 if mocap_pos is not None:
                     ik_target = mocap_pos
-                    self.left_arm.last_mocap_target_position = mocap_pos.copy()
+                    arm_state.last_mocap_target_position = mocap_pos.copy()
+                mocap_quat = self.visualizer.get_mocap_quaternion(target_name)
+                if mocap_quat is not None:
+                    q = np.asarray(mocap_quat, dtype=float)
+                    n = np.linalg.norm(q)
+                    if n > 1e-9:
+                        ik_target_quat = q / n
 
-            # Match arm_arm620_dual: no additional low-pass lag on IK target.
-            current_ee = self._get_current_ee_position("left")
+            current_ee = self._get_current_ee_position(arm_name)
             ik_target = current_ee + IK_TARGET_SMOOTHING * (ik_target - current_ee)
 
-            # Solve IK
-            ik_solution = self.robot_interface.solve_ik("left", ik_target, self.left_arm.target_orientation_quat)
-            
-            # Update robot angles (this updates internal state for visualization)
-            current_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
-            self.robot_interface.update_arm_angles("left", ik_solution, 
-                                                 self.left_arm.current_wrist_flex, 
-                                                 self.left_arm.current_wrist_roll, 
-                                                 current_gripper,
-                                                 wrist_override=True)
+            ik_requests[arm_name] = {
+                "target": ik_target,
+                "target_quat": ik_target_quat,
+                "wrist_override": True,
+            }
 
-        # Update right arm - compute IK and update angles even in simulation-only mode
-        right_drag_target = None
-        if self.visualizer:
-            right_drag_target = self.visualizer.get_mocap_position("right_target")
+        if ik_requests["left"] is not None or ik_requests["right"] is not None:
+            left_req = ik_requests["left"]
+            right_req = ik_requests["right"]
 
-        right_idle_drag = False
-        if self.right_arm.mode == ControlMode.IDLE and right_drag_target is not None:
-            prev = self.right_arm.last_mocap_target_position
-            right_idle_drag = prev is None or np.linalg.norm(right_drag_target - prev) > 1e-5
+            left_target = left_req["target"] if left_req is not None else self._get_current_ee_position("left")
+            right_target = right_req["target"] if right_req is not None else self._get_current_ee_position("right")
+            left_target_quat = left_req["target_quat"] if left_req is not None else None
+            right_target_quat = right_req["target_quat"] if right_req is not None else None
 
-        if ((self.right_arm.mode == ControlMode.POSITION_CONTROL and self.right_arm.target_position is not None)
-            or right_idle_drag):
-            ik_target = self.right_arm.target_position if self.right_arm.target_position is not None else right_drag_target
-            if self.visualizer:
-                if self.right_arm.mode == ControlMode.POSITION_CONTROL:
-                    self.visualizer.update_marker_position(
-                        "right_target", ik_target, self.right_arm.target_orientation_quat
-                    )
-                mocap_pos = self.visualizer.get_mocap_position("right_target")
-                if mocap_pos is not None:
-                    ik_target = mocap_pos
-                    self.right_arm.last_mocap_target_position = mocap_pos.copy()
+            left_solution, right_solution = self.robot_interface.solve_dual_ik(
+                left_target_position=left_target,
+                right_target_position=right_target,
+                left_target_orientation=left_target_quat,
+                right_target_orientation=right_target_quat,
+            )
 
-            current_ee = self._get_current_ee_position("right")
-            ik_target = current_ee + IK_TARGET_SMOOTHING * (ik_target - current_ee)
+            if left_req is not None:
+                left_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
+                self.robot_interface.update_arm_angles(
+                    "left",
+                    left_solution,
+                    self.left_arm.current_wrist_flex,
+                    self.left_arm.current_wrist_roll,
+                    left_gripper,
+                    wrist_override=left_req["wrist_override"],
+                )
 
-            # Solve IK
-            ik_solution = self.robot_interface.solve_ik("right", ik_target, self.right_arm.target_orientation_quat)
-            
-            # Update robot angles (this updates internal state for visualization)
-            current_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
-            self.robot_interface.update_arm_angles("right", ik_solution, 
-                                                  self.right_arm.current_wrist_flex, 
-                                                  self.right_arm.current_wrist_roll, 
-                                                  current_gripper,
-                                                  wrist_override=True)
+            if right_req is not None:
+                right_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
+                self.robot_interface.update_arm_angles(
+                    "right",
+                    right_solution,
+                    self.right_arm.current_wrist_flex,
+                    self.right_arm.current_wrist_roll,
+                    right_gripper,
+                    wrist_override=right_req["wrist_override"],
+                )
 
         # Send commands to robot hardware (only if connected and engaged)
         if self.robot_interface.is_connected and self.robot_interface.is_engaged:
             self.robot_interface.send_command()
-    
+
     def _update_visualization(self):
         """Update MuJoCo visualization."""
         if not self.visualizer:

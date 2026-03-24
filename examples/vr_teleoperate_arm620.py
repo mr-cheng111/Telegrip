@@ -15,7 +15,7 @@ Usage:
     --no-keyboard       Disable keyboard input
     --autoconnect       Automatically connect to robot motors on startup
     --log-level LEVEL   Set logging level (debug, info, warning, error, critical)
-    --config FILE       Path to config file (default: config_arm620.yaml)
+    --config FILE       Path to config file (default: config.yaml)
 
 Requirements:
     - ARM620 URDF model in mink/examples/arm620/urdf/
@@ -47,9 +47,6 @@ logger = logging.getLogger(__name__)
 def setup_arm620_config():
     """Setup configuration for ARM620 robot."""
     args = parse_arguments()
-    
-    if not hasattr(args, 'config') or args.config == "config.yaml":
-        args.config = "config_arm620.yaml"
     
     config = create_config_from_args(args)
     
