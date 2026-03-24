@@ -15,19 +15,19 @@ control:
     max_iters: 20
     mujoco_scene: mink/examples/arm620/scene_dual_unified_base.xml
     # 末端姿态误差权重（无量纲）。越大越优先“对准方向”。
-    orientation_cost: 5.0
+    orientation_cost: 0.2
     # 姿态收敛阈值（单位：弧度，旋转向量范数）。越小要求越严格。
-    orientation_error_threshold: 0.001
+    orientation_error_threshold: 0.01
     # 末端位置误差权重（无量纲）。越大越优先“到目标点”。
     position_cost: 1.0
     # 位置收敛阈值（单位：米）。越小要求越严格。
-    position_error_threshold: 0.0001
+    position_error_threshold: 0.01
     # 关节姿态保持权重（无量纲）。越大越抑制关节剧烈变化，动作更稳但更“钝”。
-    posture_cost: 0.01
+    posture_cost: 0.0001
     # 求解器正则阻尼（无量纲）。增大可抑制抖动与噪声放大，但跟踪会变慢。
-    solve_damping: 0.001
+    solve_damping: 0.00001
   pybullet:
-    enabled: true
+    enabled: false
   use_mink: true
   vr:
     enabled: true

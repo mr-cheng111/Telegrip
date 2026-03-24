@@ -134,6 +134,14 @@ class RobotInterface:
         
         self.joint_limits_min_deg = np.full(NUM_JOINTS, -180.0)
         self.joint_limits_max_deg = np.full(NUM_JOINTS, 180.0)
+        self.arm_joint_limits_min_deg = {
+            "left": np.full(NUM_JOINTS, -180.0, dtype=float),
+            "right": np.full(NUM_JOINTS, -180.0, dtype=float),
+        }
+        self.arm_joint_limits_max_deg = {
+            "left": np.full(NUM_JOINTS, 180.0, dtype=float),
+            "right": np.full(NUM_JOINTS, 180.0, dtype=float),
+        }
         
         self.fk_solvers = {'left': None, 'right': None}
         self.ik_solvers = {'left': None, 'right': None}
@@ -313,9 +321,18 @@ class RobotInterface:
                     except Exception:
                         continue
 
-            # 保持历史行为：安全夹紧沿用左臂限制。
-            self.joint_limits_min_deg = arm_limits_min_deg["left"].copy()
-            self.joint_limits_max_deg = arm_limits_max_deg["left"].copy()
+            self.arm_joint_limits_min_deg = {
+                "left": arm_limits_min_deg["left"].copy(),
+                "right": arm_limits_min_deg["right"].copy(),
+            }
+            self.arm_joint_limits_max_deg = {
+                "left": arm_limits_max_deg["left"].copy(),
+                "right": arm_limits_max_deg["right"].copy(),
+            }
+
+            # 兼容旧代码：保留左臂默认限位快照。
+            self.joint_limits_min_deg = self.arm_joint_limits_min_deg["left"].copy()
+            self.joint_limits_max_deg = self.arm_joint_limits_max_deg["left"].copy()
 
             # Detect whether this scene has a separate gripper actuator.
             for arm in ['left', 'right']:
@@ -467,23 +484,26 @@ class RobotInterface:
         right_solution = self.solve_ik("right", right_target_position, right_target_orientation)
         return left_solution, right_solution
     
-    def clamp_joint_angles(self, joint_angles: np.ndarray) -> np.ndarray:
-        """Clamp joint angles to safe limits."""
+    def clamp_joint_angles(self, joint_angles: np.ndarray, arm: str = "left") -> np.ndarray:
+        """Clamp joint angles to safe limits for the given arm."""
         processed_angles = joint_angles.copy()
-        
+
+        limits_min = self.arm_joint_limits_min_deg.get(arm, self.joint_limits_min_deg)
+        limits_max = self.arm_joint_limits_max_deg.get(arm, self.joint_limits_max_deg)
+
         shoulder_pan_idx = 0
         shoulder_pan_angle = processed_angles[shoulder_pan_idx]
-        min_limit = self.joint_limits_min_deg[shoulder_pan_idx]
-        max_limit = self.joint_limits_max_deg[shoulder_pan_idx]
-        
+        min_limit = limits_min[shoulder_pan_idx]
+        max_limit = limits_max[shoulder_pan_idx]
+
         if shoulder_pan_angle < min_limit or shoulder_pan_angle > max_limit:
             for offset in [-360.0, 360.0]:
                 wrapped_angle = shoulder_pan_angle + offset
                 if min_limit <= wrapped_angle <= max_limit:
                     processed_angles[shoulder_pan_idx] = wrapped_angle
                     break
-        
-        return np.clip(processed_angles, self.joint_limits_min_deg, self.joint_limits_max_deg)
+
+        return np.clip(processed_angles, limits_min, limits_max)
     
     def update_arm_angles(
         self,
@@ -515,7 +535,7 @@ class RobotInterface:
         if self.gripper_on_joint6.get(arm, True) and NUM_JOINTS >= 6:
             target_angles[5] = np.clip(gripper, GRIPPER_OPEN_ANGLE, GRIPPER_CLOSED_ANGLE)
         
-        clamped_angles = self.clamp_joint_angles(target_angles)
+        clamped_angles = self.clamp_joint_angles(target_angles, arm=arm)
         if self.gripper_on_joint6.get(arm, True) and NUM_JOINTS >= 6:
             clamped_angles[5] = target_angles[5]
         

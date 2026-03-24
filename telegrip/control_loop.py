@@ -84,6 +84,12 @@ class ControlLoop:
         self.last_log_time = 0
         self.log_interval = 1.0  # Log status every second
         self.sim_substeps = 1
+
+        # 运行时频率统计（动态输出）。
+        self._perf_window_start = time.perf_counter()
+        self._tick_counter = 0
+        self._mink_solve_counter = 0
+        self._mujoco_substep_counter = 0
         
         # Debug flags
         self._queue_debug_logged = False
@@ -281,6 +287,7 @@ class ControlLoop:
                         self._update_visualization()
                 
                 # Periodic logging
+                self._tick_counter += 1
                 self._periodic_logging()
                 
                 # Control rate (RateLimiter-like, monotonic clock)
@@ -934,6 +941,7 @@ class ControlLoop:
             left_target_quat = left_req["target_quat"] if left_req is not None else None
             right_target_quat = right_req["target_quat"] if right_req is not None else None
 
+            self._mink_solve_counter += 1
             left_solution, right_solution = self.robot_interface.solve_dual_ik(
                 left_target_position=left_target,
                 right_target_position=right_target,
@@ -975,6 +983,7 @@ class ControlLoop:
         self.visualizer.update_robot_pose(r_ang, "right")
         self.visualizer.set_gripper_closed("left", self.robot_interface.get_gripper_closed("left"))
         self.visualizer.set_gripper_closed("right", self.robot_interface.get_gripper_closed("right"))
+        self._mujoco_substep_counter += int(self.sim_substeps)
         self.visualizer.step_simulation(substeps=self.sim_substeps)
 
         # 6) Feed simulated feedback in no-feedback mode.
@@ -1061,6 +1070,7 @@ class ControlLoop:
             left_target_quat = left_req["target_quat"] if left_req is not None else None
             right_target_quat = right_req["target_quat"] if right_req is not None else None
 
+            self._mink_solve_counter += 1
             left_solution, right_solution = self.robot_interface.solve_dual_ik(
                 left_target_position=left_target,
                 right_target_position=right_target,
@@ -1155,6 +1165,7 @@ class ControlLoop:
             self.visualizer.hide_frame("right_goal_frame")
         
         # Step simulation once per control tick (same pattern as arm_arm620_dual).
+        self._mujoco_substep_counter += int(self.sim_substeps)
         self.visualizer.step_simulation(substeps=self.sim_substeps)
 
         # Feed back simulated joint angles when ROS state feedback is disabled.
@@ -1171,6 +1182,33 @@ class ControlLoop:
         current_time = time.time()
         if current_time - self.last_log_time >= self.log_interval:
             self.last_log_time = current_time
+
+            elapsed = max(1e-6, time.perf_counter() - self._perf_window_start)
+            ctrl_hz = self._tick_counter / elapsed
+            mink_hz = self._mink_solve_counter / elapsed
+            mujoco_substep_hz = self._mujoco_substep_counter / elapsed
+            model_dt = None
+            if self.visualizer and getattr(self.visualizer, 'model', None) is not None:
+                try:
+                    model_dt = float(self.visualizer.model.opt.timestep)
+                except Exception:
+                    model_dt = None
+
+            if model_dt is not None and model_dt > 0:
+                logger.info(
+                    f"⏱ runtime: control={ctrl_hz:.1f}Hz | mink_solve={mink_hz:.1f}Hz | "
+                    f"mujoco_substep={mujoco_substep_hz:.1f}Hz (substeps={self.sim_substeps}, model_dt={model_dt:.4f}s)"
+                )
+            else:
+                logger.info(
+                    f"⏱ runtime: control={ctrl_hz:.1f}Hz | mink_solve={mink_hz:.1f}Hz | "
+                    f"mujoco_substep={mujoco_substep_hz:.1f}Hz (substeps={self.sim_substeps})"
+                )
+
+            self._perf_window_start = time.perf_counter()
+            self._tick_counter = 0
+            self._mink_solve_counter = 0
+            self._mujoco_substep_counter = 0
             
             active_arms = []
             if self.left_arm.mode == ControlMode.POSITION_CONTROL:

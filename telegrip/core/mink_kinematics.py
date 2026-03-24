@@ -7,6 +7,7 @@ import numpy as np
 import mujoco
 from typing import Optional, Tuple, List
 import logging
+import time
 from pathlib import Path
 
 import mink
@@ -76,7 +77,7 @@ class MinkIKSolver:
         
         self.tasks: List = [self.end_effector_task, self.posture_task]
         self._mocap_ids = {}
-        
+
         self.solver = "daqp"
         self.dt = float(dt)
         self.max_iters = int(max_iters)
@@ -287,6 +288,10 @@ class MinkDualIKSolver:
         self.solve_damping = float(solve_damping)
 
         self._mocap_ids = {}
+        # IK调用频率统计（1秒窗口平均）
+        self._ik_window_start_t = time.perf_counter()
+        self._ik_window_calls = 0
+        self._ik_window_elapsed_sum_ms = 0.0
 
     def _target_se3(self, target_position: np.ndarray, target_orientation_quat: Optional[np.ndarray],
                     mocap_name: Optional[str]) -> mink.SE3:
@@ -334,6 +339,7 @@ class MinkDualIKSolver:
               current_right_angles_deg: Optional[np.ndarray] = None,
               left_mocap_name: Optional[str] = None,
               right_mocap_name: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        call_start_t = time.perf_counter()
         if current_left_angles_deg is None:
             current_left_angles_deg = np.zeros(len(self.left_joint_qpos_indices))
         if current_right_angles_deg is None:
@@ -392,6 +398,21 @@ class MinkDualIKSolver:
             self.right_joint_limits_min_deg[:right_solution_deg.shape[0]],
             self.right_joint_limits_max_deg[:right_solution_deg.shape[0]],
         )
+
+        call_elapsed_ms = (time.perf_counter() - call_start_t) * 1000.0
+        self._ik_window_calls += 1
+        self._ik_window_elapsed_sum_ms += call_elapsed_ms
+
+        window_elapsed = time.perf_counter() - self._ik_window_start_t
+        if window_elapsed >= 1.0:
+            avg_hz = self._ik_window_calls / max(1e-6, window_elapsed)
+            avg_ms = self._ik_window_elapsed_sum_ms / max(1, self._ik_window_calls)
+            logger.info(
+                f"[ik] solve_dual_ik avg: freq={avg_hz:.1f}Hz, avg_time={avg_ms:.2f}ms, calls={self._ik_window_calls}"
+            )
+            self._ik_window_start_t = time.perf_counter()
+            self._ik_window_calls = 0
+            self._ik_window_elapsed_sum_ms = 0.0
 
         return left_solution_deg, right_solution_deg
 
