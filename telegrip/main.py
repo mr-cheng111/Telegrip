@@ -86,6 +86,8 @@ def create_config_from_args(args) -> TelegripConfig:
     config.vr_orientation_reference_mode = str(
         vr_cfg.get("orientation_reference_mode", config.vr_orientation_reference_mode)
     )
+    rr_axis_map = vr_cfg.get("relative_rotation_axis_map", config.vr_relative_rotation_axis_map)
+    config.vr_relative_rotation_axis_map = rr_axis_map if isinstance(rr_axis_map, list) else []
     config.enable_gui = bool(control_cfg.get("enable_gui", config.enable_gui))
     config.enable_sim = bool(control_cfg.get("enable_sim", config.enable_sim))
     # If simulation is disabled, GUI must also be disabled.

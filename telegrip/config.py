@@ -6,7 +6,7 @@ Loads configuration from config.yaml file with fallback to default values.
 import os
 import yaml
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 import numpy as np
 from pathlib import Path
 import logging
@@ -71,7 +71,10 @@ DEFAULT_CONFIG = {
         "vr": {
             "enabled": True,
             "orientation_reference_mode": "global_calibration",
-            "orientation_reference_quat_xyzw": {}
+            "orientation_reference_quat_xyzw": {},
+            # Optional 3x3 axis remap matrix for relative-rotation delta in control loop.
+            # Keep [] to disable and use identity.
+            "relative_rotation_axis_map": []
         }
     },
     "paths": {
@@ -215,7 +218,7 @@ URDF_TO_INTERNAL_NAME_MAP = {
 # --- End Effector Configuration ---
 END_EFFECTOR_LINK_NAME = "Fixed_Jaw_tip"
 
-# --- Keyboard Control ---
+# --- Input Step Defaults ---
 POS_STEP = 0.01  # meters
 ANGLE_STEP = 5.0 # degrees
 GRIPPER_STEP = 10.0 # degrees
@@ -252,6 +255,7 @@ class TelegripConfig:
     vr_orientation_reference_mode: str = str(
         _config_data.get("control", {}).get("vr", {}).get("orientation_reference_mode", "global_calibration")
     )
+    vr_relative_rotation_axis_map: Optional[List[List[float]]] = None
     enable_keyboard: bool = False
     autoconnect: bool = False
     log_level: str = "warning"
@@ -285,7 +289,7 @@ class TelegripConfig:
     gripper_open_angle: float = GRIPPER_OPEN_ANGLE
     gripper_closed_angle: float = GRIPPER_CLOSED_ANGLE
     
-    # Keyboard control
+    # Input step defaults
     pos_step: float = POS_STEP
     angle_step: float = ANGLE_STEP
     gripper_step: float = GRIPPER_STEP
@@ -294,6 +298,12 @@ class TelegripConfig:
         if self.gnirehtet_args is None:
             cfg_args = _config_data.get("gnirehtet", {}).get("args", [])
             self.gnirehtet_args = [str(arg) for arg in cfg_args] if isinstance(cfg_args, list) else []
+        if self.vr_relative_rotation_axis_map is None:
+            cfg_map = _config_data.get("control", {}).get("vr", {}).get("relative_rotation_axis_map", [])
+            if isinstance(cfg_map, list):
+                self.vr_relative_rotation_axis_map = cfg_map.copy()
+            else:
+                self.vr_relative_rotation_axis_map = []
     
     @property
     def ssl_files_exist(self) -> bool:

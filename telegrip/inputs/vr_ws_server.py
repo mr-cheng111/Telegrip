@@ -350,27 +350,29 @@ class VRWebSocketServer(BaseInputProvider):
     async def process_controller_data(self, data: Dict):
         """Process incoming VR controller data."""
         
-        # Handle new dual controller format
+        # Primary path: dual controller packet from web-ui/vr_app.js
         if 'leftController' in data and 'rightController' in data:
             left_data = data['leftController']
             right_data = data['rightController']
+            if not isinstance(left_data, dict) or not isinstance(right_data, dict):
+                return
             self._update_orientation_calibration_hold(left_data, right_data)
             
-            # Process left controller
-            if left_data.get('position') and (left_data.get('gripActive', False) or left_data.get('trigger', 0) > 0.5):
-                await self.process_single_controller('left', left_data)
-            elif not left_data.get('gripActive', False) and self.left_controller.grip_active:
+            # Always process trigger state (gripper), independent of grip.
+            await self.process_single_controller('left', left_data)
+            await self.process_single_controller('right', right_data)
+
+            # Grip exclusively controls arm motion mode.
+            if not left_data.get('gripActive', False) and self.left_controller.grip_active:
                 await self.handle_grip_release('left')
             
-            # Process right controller
-            if right_data.get('position') and (right_data.get('gripActive', False) or right_data.get('trigger', 0) > 0.5):
-                await self.process_single_controller('right', right_data)
-            elif not right_data.get('gripActive', False) and self.right_controller.grip_active:
+            if not right_data.get('gripActive', False) and self.right_controller.grip_active:
                 await self.handle_grip_release('right')
                 
             return
-        
-        # Handle legacy single controller format
+
+        # Legacy single controller control packets are no longer supported.
+        # Keep only explicit release compatibility.
         hand = data.get('hand')
         
         # Handle explicit release messages
@@ -381,10 +383,6 @@ class VRWebSocketServer(BaseInputProvider):
         if data.get('triggerReleased'):
             await self.handle_trigger_release(hand)
             return
-            
-        # Process single controller data
-        if hand and data.get('position') and (data.get('gripActive', False) or data.get('trigger', 0) > 0.5):
-            await self.process_single_controller(hand, data)
     
     async def process_single_controller(self, hand: str, data: Dict):
         """Process data for a single controller."""
@@ -413,7 +411,7 @@ class VRWebSocketServer(BaseInputProvider):
             logger.info(f"🤏 {hand.upper()} gripper {'CLOSED' if trigger_active else 'OPENED'}")
         
         # Handle grip button for arm movement control
-        if grip_active:
+        if grip_active and position:
             if not controller.grip_active:
                 # Grip just activated - set origin and reset target position
                 controller.grip_active = True

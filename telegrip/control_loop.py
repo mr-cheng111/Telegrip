@@ -16,7 +16,7 @@ from .config import TelegripConfig, NUM_JOINTS, WRIST_FLEX_INDEX, WRIST_ROLL_IND
 from .core.robot_interface import RobotInterface
 # MuJoCoVisualizer will be imported on demand
 from .inputs.base import ControlGoal, ControlMode
-# WebKeyboardHandler will be imported on demand to avoid circular imports
+# Optional input handlers are imported on demand to avoid circular imports
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class ControlLoop:
         # Components
         self.robot_interface = None
         self.visualizer = None
-        self.web_keyboard_handler = None  # Reference to web-based keyboard handler
+        self.web_keyboard_handler = None  # Optional external input handler reference
         
         # Arm states
         self.left_arm = ArmState("left")
@@ -96,23 +96,26 @@ class ControlLoop:
         self._process_debug_logged = False
         
         self.is_running = False
-        # Direct-hand-map local rotation offset:
-        # apply a local X-axis rotation of -90 deg to hand orientation.
-        self._direct_map_local_delta_quat = self._quat_from_euler_xyz_deg(0.0, 0.0, 0.0)
         # VR relative translation -> base_link translation remap.
         # +X(right) -> -Y, +/-Y(front/back) -> +/-X, Z unchanged.
         self._vr_delta_to_base_quat = self._quat_from_euler_xyz_deg(0.0, 0.0, -90.0)
-        # Controller-delta -> target-delta orientation frame mapping:
-        # X_hand -> X_target, Y_hand -> -Y_target, Z_hand -> Z_target
-        # 该映射矩阵 S（列向量为手柄基轴在目标系中的表示）:
-        #   S = diag(1, -1, 1)
-        # 姿态增量采用基变换公式:
-        #   R_delta_target = S * R_delta_hand * S^T
-        # 公式来源: 同一旋转在两套坐标基下的相似变换（change of basis）。
+        # Controller-delta -> target-delta orientation frame mapping.
+        # The VR-side frame correction has been applied before transmission, so
+        # this mapping stays identity in control loop.
         self._controller_delta_to_target_axis_map = np.array(
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             dtype=float,
         )
+        # Optional extra axis remap after relative-rotation delta conversion.
+        # User-configurable via control.vr.relative_rotation_axis_map (3x3).
+        self._relative_rotation_post_axis_map = self._parse_axis_remap_matrix(
+            getattr(self.config, "vr_relative_rotation_axis_map", [])
+        )
+        if not np.allclose(self._relative_rotation_post_axis_map, np.eye(3), atol=1e-9):
+            logger.info(
+                "Using vr.relative_rotation_axis_map:\n"
+                f"{self._relative_rotation_post_axis_map}"
+            )
         # Guard to ensure startup joint_state->MuJoCo alignment runs only once.
         self._startup_joint_state_initialized = False
 
@@ -126,6 +129,34 @@ class ControlLoop:
         if not np.all(np.isfinite(arr)):
             return None
         return arr.copy()
+
+    @staticmethod
+    def _parse_axis_remap_matrix(raw_matrix) -> np.ndarray:
+        """Parse optional 3x3 axis remap matrix; fallback to identity on invalid input."""
+        identity = np.eye(3, dtype=float)
+        if raw_matrix is None:
+            return identity
+        if isinstance(raw_matrix, list) and len(raw_matrix) == 0:
+            return identity
+        try:
+            mat = np.asarray(raw_matrix, dtype=float)
+        except Exception:
+            logger.warning("Invalid vr.relative_rotation_axis_map type; using identity")
+            return identity
+        if mat.shape != (3, 3) or not np.all(np.isfinite(mat)):
+            logger.warning("vr.relative_rotation_axis_map must be a finite 3x3 matrix; using identity")
+            return identity
+
+        # Similarity transform S*R*S^T assumes orthonormal axis map.
+        ortho_err = float(np.max(np.abs(mat @ mat.T - identity)))
+        det = float(np.linalg.det(mat))
+        if ortho_err > 1e-3 or abs(abs(det) - 1.0) > 1e-3:
+            logger.warning(
+                "vr.relative_rotation_axis_map is not an orthonormal axis map "
+                f"(ortho_err={ortho_err:.3e}, det={det:.6f}); using identity"
+            )
+            return identity
+        return mat
 
     def _collect_startup_joint_state_pose_deg(self, timeout_s: float = 3.0) -> Optional[Dict[str, np.ndarray]]:
         """Fetch one startup joint_state snapshot and convert to degree pose."""
@@ -344,7 +375,7 @@ class ControlLoop:
             for i, error in enumerate(setup_errors, 1):
                 logger.error(f"  {i}. {error}")
         
-        # Set robot interface on web keyboard handler so it can get current positions
+        # Pass robot interface to external input handler if present.
         if self.web_keyboard_handler and self.robot_interface:
             self.web_keyboard_handler.set_robot_interface(self.robot_interface)
             logger.info("Set robot interface on web keyboard handler")
@@ -664,7 +695,7 @@ class ControlLoop:
                 success = self.robot_interface.engage()
                 if success:
                     logger.info("🔌 Robot motors ENGAGED via API")
-                    # No need to sync keyboard targets - unified system handles this automatically
+                    # Unified control path keeps targets synchronized automatically.
                 else:
                     logger.error("❌ Failed to engage robot motors")
             else:
@@ -699,7 +730,7 @@ class ControlLoop:
         """Execute a control goal."""
         arm_state = self.left_arm if goal.arm == "left" else self.right_arm
         
-        # Handle special reset signal from keyboard idle timeout
+        # Handle special reset signal from external input timeout.
         if (goal.metadata and goal.metadata.get("reset_target_to_current", False)):
             if self.robot_interface and arm_state.mode == ControlMode.POSITION_CONTROL:
                 # Reset target position to current robot position
@@ -774,12 +805,12 @@ class ControlLoop:
                 
                 logger.info(f"🔓 {goal.arm.upper()} arm: Position control DEACTIVATED")
         
-        # Handle position control - both VR and keyboard now work the same way (absolute offset from origin)
+        # Position control uses absolute offset from origin.
         if goal.target_position is not None and arm_state.mode == ControlMode.POSITION_CONTROL:
             if goal.metadata and goal.metadata.get("relative_position", False):
                 delta = np.asarray(goal.target_position, dtype=float)
                 delta_base = self._rotate_vec_by_quat_wxyz(delta, self._vr_delta_to_base_quat)
-                # Both VR and keyboard send absolute offset from robot origin position
+                # Relative input is interpreted as absolute offset from arm origin.
                 if arm_state.origin_position is not None:
                     arm_state.target_position = arm_state.origin_position + delta_base
                     arm_state.goal_position = arm_state.target_position.copy()
@@ -798,102 +829,46 @@ class ControlLoop:
                 q = np.asarray(goal.target_orientation_quat, dtype=float).reshape(-1)
                 if q.size >= 4:
                     q_in = self._quat_normalize_wxyz(q[:4])
-                    use_direct_hand_map = bool(
-                        goal.metadata and goal.metadata.get("direct_hand_to_target_map", False)
+                    q_mapped = self._quat_normalize_wxyz(q_in)
+                    use_marker_grab_drag = bool(
+                        goal.metadata and goal.metadata.get("marker_grab_drag", False)
                     )
 
-                    if use_direct_hand_map:
-                        # Direct map + local-frame extra rotation:
-                        # q_target = q_in ⊗ q_local_delta
-                        # (right-multiply => rotate around hand's own axes)
-                        q_out = self._quat_multiply_wxyz(
-                            q_in, self._direct_map_local_delta_quat
+                    if use_marker_grab_drag:
+                        # Grip-drag mode: input quaternion is controller-local delta
+                        # relative to grip press. Convert that delta into target frame,
+                        # then apply it on the grip-time target orientation.
+                        R_delta_hand = self._quat_to_rotation_matrix_wxyz(q_mapped)
+                        S = self._controller_delta_to_target_axis_map
+                        R_delta_target = S @ R_delta_hand @ S.T
+                        U = self._relative_rotation_post_axis_map
+                        R_delta_target = U @ R_delta_target @ U.T
+                        q_delta_target = self._quat_from_rotation_matrix_wxyz(
+                            R_delta_target
                         )
+                        q_init = arm_state.origin_target_orientation_quat
+                        if q_init is None:
+                            q_init = self._get_current_ee_orientation(goal.arm)
+                        q_init = self._quat_normalize_wxyz(np.asarray(q_init, dtype=float))
+                        q_out = self._quat_multiply_wxyz(q_init, q_delta_target)
                         arm_state.target_orientation_quat = self._quat_normalize_wxyz(q_out)
-
-
-
-
                     else:
-                        # Legacy branches also use raw input orientation (no fixed remap).
-                        q_mapped = self._quat_normalize_wxyz(q_in)
-
-                        use_abs_controller = bool(
-                            goal.metadata and goal.metadata.get("controller_orientation_absolute", False)
-                        )
-                        use_marker_grab_drag = bool(
-                            goal.metadata and goal.metadata.get("marker_grab_drag", False)
-                        )
-                        if use_abs_controller and arm_state.origin_target_orientation_quat is not None:
-                            # One-time calibration at grip activation:
-                            # q_target = q_controller_abs * q_offset
-                            # q_offset = inv(q_controller_abs) * q_target0
-                            if arm_state.controller_to_target_offset_quat is None:
-                                arm_state.controller_to_target_offset_quat = self._quat_multiply_wxyz(
-                                    self._quat_inverse_wxyz(q_mapped),
-                                    arm_state.origin_target_orientation_quat,
-                                )
-                                arm_state.controller_to_target_offset_quat = self._quat_normalize_wxyz(
-                                    arm_state.controller_to_target_offset_quat
-                                )
-
-                            q_out = self._quat_multiply_wxyz(
-                                q_mapped,
-                                arm_state.controller_to_target_offset_quat,
-                            )
-                            arm_state.target_orientation_quat = self._quat_normalize_wxyz(q_out)
-                        elif use_marker_grab_drag:
-                            # "Relative to initialization" behavior:
-                            # 1) q_mapped is controller local delta (from init calibration).
-                            # 2) Map controller-delta frame into target-delta frame.
-                            #    R_delta_target = S * R_delta_controller * S^T
-                            # 3) Apply delta on target's initialized orientation in local order:
-                            #    q_target = q_target_init * q_delta_target
-                            R_delta_hand = self._quat_to_rotation_matrix_wxyz(q_mapped)
-                            S = self._controller_delta_to_target_axis_map
-                            R_delta_target = S @ R_delta_hand @ S.T
-                            q_delta_target = self._quat_from_rotation_matrix_wxyz(
-                                R_delta_target
-                            )
-                            # Use grip-time target orientation as baseline so there is
-                            # no hard-coded "default" target direction jump at grip press.
-                            q_init = arm_state.origin_target_orientation_quat
-                            if q_init is None:
-                                q_init = self._get_current_ee_orientation(goal.arm)
-                            q_init = self._quat_normalize_wxyz(np.asarray(q_init, dtype=float))
-
-                            q_out = self._quat_multiply_wxyz(
-                                q_init,
-                                q_delta_target,
-                            )
-                            arm_state.target_orientation_quat = self._quat_normalize_wxyz(q_out)
-                        elif (
-                            goal.metadata
-                            and goal.metadata.get("relative_position", False)
-                            and arm_state.origin_target_orientation_quat is not None
-                        ):
-                            # Legacy relative accumulation mode.
-                            q_out = self._quat_multiply_wxyz(
-                                arm_state.origin_target_orientation_quat,
-                                q_mapped,
-                            )
-                            arm_state.target_orientation_quat = self._quat_normalize_wxyz(q_out)
-                        else:
-                            arm_state.target_orientation_quat = q_mapped
+                        # Fallback absolute quaternion path.
+                        arm_state.target_orientation_quat = q_mapped
             
-            # Handle wrist movements - both VR and keyboard send absolute offsets from origin
+            # Handle wrist roll using absolute offset from origin.
             if goal.wrist_roll_deg is not None:
                 if goal.metadata and goal.metadata.get("relative_position", False):
-                    # Both VR and keyboard send absolute wrist angle relative to origin
+                    # Relative input is interpreted from grip-time wrist origin.
                     arm_state.current_wrist_roll = arm_state.origin_wrist_roll_angle + goal.wrist_roll_deg
                 else:
                     # Absolute wrist roll (legacy)
                     arm_state.current_wrist_roll = goal.wrist_roll_deg
             
-            # Handle wrist flex - both VR and keyboard send absolute offsets from origin
+            # Handle wrist flex using absolute offset from origin.
             if goal.wrist_flex_deg is not None:
                 if goal.metadata and goal.metadata.get("relative_position", False):
-                    # Both VR and keyboard send absolute wrist angle relative to origin
+                    # Relative input is interpreted from grip-time wrist origin.
                     arm_state.current_wrist_flex = arm_state.origin_wrist_flex_angle + goal.wrist_flex_deg
                 else:
                     # Absolute wrist flex (legacy)

@@ -32,6 +32,14 @@ control:
   vr:
     enabled: true
     orientation_reference_mode: grip_press # grip_press global_calibration
+    # 可选：相对旋转增量的二次轴映射（3x3 正交矩阵）。
+    # 先留空表示不启用（等价单位阵）。
+    # 调整后: X/Y 方向翻转，保持 Z 映射符合当前需求
+    # X -> +X, Y -> +Z, Z -> +Y
+    relative_rotation_axis_map:
+    - [1, 0, 0]
+    - [0, 0, 1]
+    - [0, 1, 0]
     orientation_reference_quat_xyzw:
       left:
       - 0
