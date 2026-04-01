@@ -52,6 +52,8 @@ DEFAULT_CONFIG = {
         "vr_to_robot_scale": 1.0,
         "send_interval": 0.05,
         "require_state_feedback": False,
+        # Hard gate for real-robot motion: block commands until /joint_states is received.
+        "require_joint_state_for_motion": True,
     },
     "control": {
         "use_mink": True,
@@ -255,6 +257,9 @@ class TelegripConfig:
     vr_to_robot_scale: float = VR_TO_ROBOT_SCALE
     send_interval: float = SEND_INTERVAL
     require_state_feedback: bool = _config_data["robot"].get("require_state_feedback", False)
+    require_joint_state_for_motion: bool = bool(
+        _config_data["robot"].get("require_joint_state_for_motion", True)
+    )
     robot_command_backend: str = str(_config_data["robot"].get("command_backend", "ros2_topic"))
     arm_controller_workspace: str = str(
         _config_data["robot"].get("arm_controller", {}).get("workspace", "/home/nvidia/Projects/universal-arm-controller")
@@ -333,6 +338,7 @@ class TelegripConfig:
             else:
                 self.vr_relative_rotation_axis_map = []
         self.robot_command_backend = str(self.robot_command_backend or "ros2_topic").strip().lower()
+        self.require_joint_state_for_motion = bool(self.require_joint_state_for_motion)
         self.arm_controller_left_mapping = str(self.arm_controller_left_mapping or "left_arm").strip()
         self.arm_controller_right_mapping = str(self.arm_controller_right_mapping or "right_arm").strip()
         self.arm_command_interpolation_alpha = float(np.clip(self.arm_command_interpolation_alpha, 0.0, 1.0))

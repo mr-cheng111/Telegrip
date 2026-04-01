@@ -17,7 +17,7 @@ control:
     max_iters: 20
     mujoco_scene: mink/examples/arm620/scene_dual_unified_base.xml
     # 末端姿态误差权重（无量纲）。越大越优先“对准方向”。
-    orientation_cost: 0.2
+    orientation_cost: 0.1
     # 姿态收敛阈值（单位：弧度，旋转向量范数）。越小要求越严格。
     orientation_error_threshold: 0.01
     # 末端位置误差权重（无量纲）。越大越优先“到目标点”。
@@ -62,7 +62,7 @@ gripper:
 ik:
   hysteresis_threshold: 0.05
   movement_penalty_weight: 0.01
-  position_error_threshold: 0.001
+  position_error_threshold: 0.01
   reference_poses_file: reference_poses_arm620.json
   use_reference_poses: true
 network:
@@ -73,6 +73,7 @@ paths:
   urdf_path: mink/examples/arm620/urdf/arm620.urdf
 robot:
   command_backend: command_streaming
+  require_joint_state_for_motion: true
   arm_controller:
     workspace: /home/nvidia/Projects/universal-arm-controller
     module_dir: ""

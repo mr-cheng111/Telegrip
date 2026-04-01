@@ -449,7 +449,11 @@ class ControlLoop:
         if self.robot_interface:
             # In simulation/no-feedback mode, initialize command state from MuJoCo qpos
             # so IK starts from the actual simulated posture instead of zeros.
-            if self.visualizer and not self.config.require_state_feedback:
+            if (
+                self.visualizer
+                and not self.config.require_state_feedback
+                and not getattr(self.config, "require_joint_state_for_motion", False)
+            ):
                 l_sim = self.visualizer.get_joint_angles_deg("left")
                 r_sim = self.visualizer.get_joint_angles_deg("right")
                 if l_sim is not None:
@@ -718,6 +722,12 @@ class ControlLoop:
         # Handle mode changes (only if mode is specified)
         if goal.mode is not None and goal.mode != arm_state.mode:
             if goal.mode == ControlMode.POSITION_CONTROL:
+                if self.robot_interface and not self.robot_interface.is_motion_gate_ready():
+                    logger.warning(
+                        f"⏸ {goal.arm.upper()} arm position-control request ignored: "
+                        "waiting for /joint_states gate"
+                    )
+                    return
                 # Activate position control - always reset target to current position
                 arm_state.mode = ControlMode.POSITION_CONTROL
                 
@@ -874,10 +884,11 @@ class ControlLoop:
             goal_name = f"{arm_name}_goal"
             actual_pos = self._get_current_ee_position(arm_name)
             actual_quat = self._get_current_ee_orientation(arm_name)
+            motion_gate_ready = self.robot_interface.is_motion_gate_ready() if self.robot_interface else True
 
             # IDLE policy: target marker must remain exactly on tools_link every frame.
             # This prevents idle drift and avoids grip press/release transients.
-            if arm_state.mode != ControlMode.POSITION_CONTROL:
+            if arm_state.mode != ControlMode.POSITION_CONTROL or not motion_gate_ready:
                 self.visualizer.update_marker_position(target_name, actual_pos, actual_quat)
                 arm_state.last_mocap_target_position = actual_pos.copy()
                 arm_state.last_mocap_target_quaternion = actual_quat.copy()

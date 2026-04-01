@@ -320,6 +320,9 @@ class RobotInterface:
     def __init__(self, config: TelegripConfig):
         self.config = config
         self.require_state_feedback = bool(getattr(config, "require_state_feedback", False))
+        self.require_joint_state_for_motion = bool(
+            getattr(config, "require_joint_state_for_motion", True)
+        )
         self.command_backend = str(getattr(config, "robot_command_backend", "ros2_topic") or "ros2_topic").strip().lower()
         self.use_command_streaming = self.command_backend in {"command_streaming", "ipc", "ipc_streaming"}
         self.ros_node = None
@@ -330,6 +333,9 @@ class RobotInterface:
         self.is_engaged = True
         self._last_reconnect_attempt_time = 0.0
         self._reconnect_interval_s = 1.0
+        self._joint_state_gate_ready = False
+        self._last_joint_state_gate_warn_time = 0.0
+        self._joint_state_gate_warn_interval_s = 1.0
         
         self.left_arm_connected = False
         self.right_arm_connected = False
@@ -383,6 +389,7 @@ class RobotInterface:
             return True
 
         try:
+            self._joint_state_gate_ready = False
             # Cleanup stale resources from previous failed sessions.
             if self.streaming_client is not None:
                 try:
@@ -427,6 +434,8 @@ class RobotInterface:
                 self.right_arm_connected = True
                 self.is_connected = True
                 logger.info("🤖 Robot interface connected via command streaming backend")
+                if self.require_joint_state_for_motion:
+                    logger.info("🔒 Motion gate active: waiting for /joint_states before sending commands")
                 return True
 
             # Legacy ROS topic backend.
@@ -454,6 +463,8 @@ class RobotInterface:
 
             if not self.require_state_feedback:
                 logger.info("✅ Feedback check disabled: publishing commands without feedback gating")
+            if self.require_joint_state_for_motion:
+                logger.info("🔒 Motion gate active: waiting for /joint_states before sending commands")
 
             return True
 
@@ -498,6 +509,39 @@ class RobotInterface:
                 self.left_arm_angles = self.ros_node.left_arm_angles.copy()
             if self.right_arm_connected:
                 self.right_arm_angles = self.ros_node.right_arm_angles.copy()
+
+    def _check_joint_state_motion_gate(self, spin_once: bool = True) -> Tuple[bool, bool]:
+        """Return (ready, just_opened) for motion gating by /joint_states availability."""
+        if not self.require_joint_state_for_motion:
+            self._joint_state_gate_ready = True
+            return True, False
+
+        if not (ROS2_AVAILABLE and self.ros_node is not None and rclpy.ok()):
+            self._joint_state_gate_ready = False
+            return False, False
+
+        if spin_once:
+            try:
+                rclpy.spin_once(self.ros_node, timeout_sec=0.0)
+            except Exception as e:
+                logger.debug(f"joint_state gate spin_once failed: {e}")
+
+        left_ready = float(getattr(self.ros_node, "last_left_msg_time", 0.0)) > 0.0
+        right_ready = float(getattr(self.ros_node, "last_right_msg_time", 0.0)) > 0.0
+        ready = bool(left_ready and right_ready)
+        just_opened = ready and not self._joint_state_gate_ready
+
+        if just_opened:
+            # First time feedback becomes available: seed command state from hardware
+            # to avoid sending stale/sim defaults on the first command frame.
+            self.left_arm_angles = self.ros_node.left_actual_angles.copy()
+            self.right_arm_angles = self.ros_node.right_actual_angles.copy()
+            self.left_sim_angles = self.left_arm_angles.copy()
+            self.right_sim_angles = self.right_arm_angles.copy()
+            logger.info("✅ /joint_states received for both arms; motion gate opened")
+
+        self._joint_state_gate_ready = ready
+        return ready, just_opened
 
     def wait_for_joint_state_snapshot(self, timeout_s: float = 1.0) -> Dict[str, np.ndarray]:
         """Spin ROS subscriptions briefly and return latest raw joint_state samples.
@@ -717,7 +761,10 @@ class RobotInterface:
     
     def get_current_end_effector_position(self, arm: str) -> np.ndarray:
         """Get current end effector position."""
-        angles = self.left_arm_angles if arm == "left" else self.right_arm_angles
+        if self.require_joint_state_for_motion:
+            angles = self.get_actual_arm_angles(arm)
+        else:
+            angles = self.left_arm_angles if arm == "left" else self.right_arm_angles
         
         if self.fk_solvers[arm]:
             position, _ = self.fk_solvers[arm].compute(angles)
@@ -876,6 +923,17 @@ class RobotInterface:
             self._maybe_auto_reconnect()
             if not self.is_connected or self.streaming_client is None:
                 return False
+
+        gate_ready, gate_just_opened = self._check_joint_state_motion_gate(spin_once=True)
+        if not gate_ready:
+            now = time.time()
+            if now - self._last_joint_state_gate_warn_time >= self._joint_state_gate_warn_interval_s:
+                logger.warning("🚫 Motion blocked: waiting for /joint_states from both arms")
+                self._last_joint_state_gate_warn_time = now
+            return False
+        if gate_just_opened:
+            # Skip one frame to ensure seeded command state is stable.
+            return False
         
         current_time = time.time()
         if current_time - self.last_send_time < self.config.send_interval:
@@ -973,6 +1031,18 @@ class RobotInterface:
     
     def get_actual_arm_angles(self, arm: str) -> np.ndarray:
         """Get actual joint angles from robot hardware."""
+        # If motion gate is enabled, always prefer real joint-state feedback whenever available.
+        if self.require_joint_state_for_motion:
+            try:
+                if self.ros_node and ROS2_AVAILABLE and rclpy.ok():
+                    rclpy.spin_once(self.ros_node, timeout_sec=0.0)
+                    if arm == "left" and self.ros_node.last_left_msg_time > 0.0:
+                        return self.ros_node.left_actual_angles.copy()
+                    if arm == "right" and self.ros_node.last_right_msg_time > 0.0:
+                        return self.ros_node.right_actual_angles.copy()
+            except Exception as e:
+                logger.debug(f"Could not get gated actual angles: {e}")
+
         # In no-feedback mode, there is no reliable joint state subscriber data.
         # Prefer MuJoCo simulated feedback if available.
         if not self.require_state_feedback:
@@ -1020,13 +1090,22 @@ class RobotInterface:
                 rclpy.shutdown()
             
             self.is_connected = False
+            self._joint_state_gate_ready = False
             logger.info("Robot interface disconnected")
             
         except Exception as e:
             logger.error(f"Error disconnecting robot: {e}")
 
+    def is_motion_gate_ready(self) -> bool:
+        """Whether motion is allowed under /joint_states gate policy."""
+        if not self.require_joint_state_for_motion:
+            return True
+        return bool(self._joint_state_gate_ready)
+
     def get_arm_connection_status(self, arm: str) -> bool:
         """Return per-arm connection status used by status API/UI."""
+        if self.require_joint_state_for_motion and not self._joint_state_gate_ready:
+            return False
         if not self.require_state_feedback and self.is_connected:
             return True
         return self.left_arm_connected if arm == "left" else self.right_arm_connected
