@@ -48,8 +48,8 @@ class RobotROSNode(Node):
         self.left_cmd_pub = self.create_publisher(JointState, '/left_arm/joint_commands', 10)
         self.right_cmd_pub = self.create_publisher(JointState, '/right_arm/joint_commands', 10)
         
-        self.left_state_sub = self.create_subscription(JointState, '/left_arm/joint_states', self._left_state_callback, 10)
-        self.right_state_sub = self.create_subscription(JointState, '/right_arm/joint_states', self._right_state_callback, 10)
+        # Subscribe only to aggregated /joint_states and parse by joint names.
+        self.all_state_sub = self.create_subscription(JointState, '/joint_states', self._joint_state_callback, 10)
         
         self.left_arm_connected = False
         self.right_arm_connected = False
@@ -64,18 +64,82 @@ class RobotROSNode(Node):
             self.right_arm_connected = True
         
         logger.info("ROS2 robot interface node initialized")
-    
-    def _left_state_callback(self, msg: JointState):
-        if len(msg.position) >= NUM_JOINTS:
-            self.left_actual_angles = np.array(msg.position[:NUM_JOINTS])
-            self.last_left_msg_time = time.time()
+
+    @staticmethod
+    def _normalize_joint_state_units(angles: np.ndarray) -> np.ndarray:
+        """Convert joint_state values from radians to degrees."""
+        arr = np.asarray(angles, dtype=float).reshape(-1)[:NUM_JOINTS]
+        if arr.size < NUM_JOINTS:
+            return arr
+        return np.rad2deg(arr)
+
+    def _extract_arm_angles_from_msg(self, arm: str, msg: JointState) -> Optional[np.ndarray]:
+        """Extract one arm's 6 joints from JointState by explicit joint names."""
+        if msg is None or not hasattr(msg, "position"):
+            return None
+
+        positions = np.asarray(msg.position, dtype=float).reshape(-1)
+        if positions.size == 0:
+            return None
+
+        names = list(msg.name) if hasattr(msg, "name") and msg.name is not None else []
+        if names:
+            name_to_idx = {}
+            upper = min(len(names), positions.size)
+            for i in range(upper):
+                n = str(names[i])
+                if n not in name_to_idx:
+                    name_to_idx[n] = i
+
+            joint_sets = [
+                [f"{arm}_joint{i}" for i in range(1, NUM_JOINTS + 1)],
+                [f"{arm}/joint{i}" for i in range(1, NUM_JOINTS + 1)],
+                [f"joint{i}" for i in range(1, NUM_JOINTS + 1)],
+            ]
+            for joint_names in joint_sets:
+                idxs = []
+                ok = True
+                for jn in joint_names:
+                    idx = name_to_idx.get(jn)
+                    if idx is None:
+                        # Tolerate namespaced joints, e.g. "robot/right_joint1".
+                        for cand, cand_idx in name_to_idx.items():
+                            if cand.endswith("/" + jn) or cand.endswith(jn):
+                                idx = cand_idx
+                                break
+                    if idx is None:
+                        ok = False
+                        break
+                    idxs.append(idx)
+                if ok:
+                    return self._normalize_joint_state_units(positions[idxs])
+
+        # Fallback for legacy per-arm topics without names.
+        if positions.size >= NUM_JOINTS:
+            return self._normalize_joint_state_units(positions[:NUM_JOINTS])
+        return None
+
+    def _update_arm_state_from_msg(self, arm: str, msg: JointState) -> bool:
+        """Parse and update one arm state from JointState message."""
+        angles = self._extract_arm_angles_from_msg(arm, msg)
+        if angles is None or angles.size < NUM_JOINTS:
+            return False
+
+        now = time.time()
+        if arm == "left":
+            self.left_actual_angles = angles.copy()
+            self.last_left_msg_time = now
             self.left_arm_connected = True
-    
-    def _right_state_callback(self, msg: JointState):
-        if len(msg.position) >= NUM_JOINTS:
-            self.right_actual_angles = np.array(msg.position[:NUM_JOINTS])
-            self.last_right_msg_time = time.time()
+        else:
+            self.right_actual_angles = angles.copy()
+            self.last_right_msg_time = now
             self.right_arm_connected = True
+        return True
+    
+    def _joint_state_callback(self, msg: JointState):
+        """Handle aggregated /joint_states that contains both arms."""
+        self._update_arm_state_from_msg("left", msg)
+        self._update_arm_state_from_msg("right", msg)
     
     def publish_command(self, arm: str, angles: np.ndarray):
         msg = JointState()
@@ -228,6 +292,38 @@ class RobotInterface:
                 self.left_arm_angles = self.ros_node.left_arm_angles.copy()
             if self.right_arm_connected:
                 self.right_arm_angles = self.ros_node.right_arm_angles.copy()
+
+    def wait_for_joint_state_snapshot(self, timeout_s: float = 1.0) -> Dict[str, np.ndarray]:
+        """Spin ROS subscriptions briefly and return latest raw joint_state samples.
+
+        This is used at startup to initialize MuJoCo pose from real robot state
+        exactly once, even when continuous feedback mode is disabled.
+        """
+        snapshot: Dict[str, np.ndarray] = {}
+        if not (ROS2_AVAILABLE and self.ros_node and rclpy.ok()):
+            return snapshot
+
+        timeout_s = max(0.0, float(timeout_s))
+        deadline = time.perf_counter() + timeout_s
+
+        while True:
+            try:
+                rclpy.spin_once(self.ros_node, timeout_sec=0.02)
+            except Exception as e:
+                logger.debug(f"startup joint_state spin_once failed: {e}")
+                break
+
+            if self.ros_node.last_left_msg_time > 0.0:
+                snapshot["left"] = self.ros_node.left_actual_angles.copy()
+            if self.ros_node.last_right_msg_time > 0.0:
+                snapshot["right"] = self.ros_node.right_actual_angles.copy()
+
+            if "left" in snapshot and "right" in snapshot:
+                break
+            if time.perf_counter() >= deadline:
+                break
+
+        return snapshot
     
     def setup_mink_kinematics(self, mujoco_scene_path: str, end_effector_site: str = "tools_link",
                              joint_names: list = None):

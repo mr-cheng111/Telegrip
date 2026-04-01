@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
         },
         "vr": {
             "enabled": True,
+            "orientation_reference_mode": "global_calibration",
             "orientation_reference_quat_xyzw": {}
         }
     },
@@ -248,6 +249,9 @@ class TelegripConfig:
     enable_gui: bool = True
     enable_robot: bool = True
     enable_vr: bool = True
+    vr_orientation_reference_mode: str = str(
+        _config_data.get("control", {}).get("vr", {}).get("orientation_reference_mode", "global_calibration")
+    )
     enable_keyboard: bool = False
     autoconnect: bool = False
     log_level: str = "warning"

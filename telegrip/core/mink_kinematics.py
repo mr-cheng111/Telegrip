@@ -407,7 +407,7 @@ class MinkDualIKSolver:
         if window_elapsed >= 1.0:
             avg_hz = self._ik_window_calls / max(1e-6, window_elapsed)
             avg_ms = self._ik_window_elapsed_sum_ms / max(1, self._ik_window_calls)
-            logger.info(
+            logger.debug(
                 f"[ik] solve_dual_ik avg: freq={avg_hz:.1f}Hz, avg_time={avg_ms:.2f}ms, calls={self._ik_window_calls}"
             )
             self._ik_window_start_t = time.perf_counter()

@@ -71,46 +71,257 @@ AFRAME.registerComponent('controller-updater', {
     this.leftZAxisRotation = 0;
     this.rightZAxisRotation = 0;
 
+    // --- Controller frame correction ---
+    // Observed on Quest: Z points down and Y points toward the operator.
+    // Apply a fixed local-frame correction so visualization and transmitted
+    // orientation use a Y-up convention.
+    this.controllerFrameCorrectionDeg = { x: 0, y: 0, z: 0 };
+    this.controllerFrameCorrectionQuat = new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(
+        THREE.MathUtils.degToRad(this.controllerFrameCorrectionDeg.x),
+        THREE.MathUtils.degToRad(this.controllerFrameCorrectionDeg.y),
+        THREE.MathUtils.degToRad(this.controllerFrameCorrectionDeg.z),
+        'XYZ'
+      )
+    ).normalize();
+    this.controllerFrameCorrectionRotationString = `${this.controllerFrameCorrectionDeg.x} ${this.controllerFrameCorrectionDeg.y} ${this.controllerFrameCorrectionDeg.z}`;
+
     // --- Get hostname dynamically ---
     const serverHostname = window.location.hostname;
-    const websocketPort = 8442; // Make sure this matches controller_server.py
-    const websocketUrl = `wss://${serverHostname}:${websocketPort}`;
-    debugLog(`🔌 Connecting to: ${websocketUrl}`);
-    console.log(`Attempting WebSocket connection to: ${websocketUrl}`);
+    const wsPortFromQuery = parseInt(new URLSearchParams(window.location.search).get('ws_port') || '', 10);
+    let wsPortFromStorage = NaN;
+    try {
+      wsPortFromStorage = parseInt(window.localStorage.getItem('telegrip_ws_port') || '', 10);
+    } catch (e) {
+      wsPortFromStorage = NaN;
+    }
+    this.websocketPort = Number.isFinite(wsPortFromQuery) && wsPortFromQuery > 0
+      ? wsPortFromQuery
+      : (Number.isFinite(wsPortFromStorage) && wsPortFromStorage > 0 ? wsPortFromStorage : 8442);
+    this.updateWebSocketUrl = () => {
+      this.websocketUrl = `wss://${serverHostname}:${this.websocketPort}`;
+    };
+    this.updateWebSocketUrl();
+    this.persistWebSocketPort = () => {
+      try {
+        window.localStorage.setItem('telegrip_ws_port', String(this.websocketPort));
+      } catch (e) {
+        // ignore storage failures
+      }
+    };
+    this.lastWsPortRefreshMs = 0;
+    this.wsPortRefreshIntervalMs = 5000;
+    this.wsReconnectTimer = null;
+    this.wsReconnectAttempt = 0;
+    this.wsMaxReconnectDelayMs = 5000;
+    this.wsShouldReconnect = true;
+    this.wsConnectInProgress = false;
+    this.wsConnectStartedAt = 0;
+    this.wsConnectTimeoutMs = 8000;
+    this.wsDisconnectedSince = null;
+    this.wsAutoReloadDelayMs = 20000;
+    this.wsLastAutoReloadMs = 0;
+    this.backendProbeIntervalMs = 3000;
+    this.backendProbeTimer = null;
+    this.backendProbeInFlight = false;
+    this.lastBackendProbeMs = 0;
+    debugLog(`🔌 Connecting to: ${this.websocketUrl}`);
+    console.log(`Attempting WebSocket connection to: ${this.websocketUrl}`);
     // !!! IMPORTANT: Replace 'YOUR_LAPTOP_IP' with the actual IP address of your laptop !!!
     // const websocketUrl = 'ws://YOUR_LAPTOP_IP:8442';
-    try {
-      this.websocket = new WebSocket(websocketUrl);
-      this.websocket.onopen = (event) => {
-        debugLog(`✅ WebSocket connected!`);
-        console.log(`WebSocket connected to ${websocketUrl}`);
-        this.reportVRStatus(true);
-      };
-      this.websocket.onerror = (event) => {
-        // More detailed error logging
-        debugLog(`❌ WebSocket Error: ${event.type}`);
-        console.error(`WebSocket Error: Event type: ${event.type}`, event);
-        this.reportVRStatus(false);
-      };
-      this.websocket.onclose = (event) => {
-        debugLog(`❌ WebSocket closed: ${event.code}`);
-        console.log(`WebSocket disconnected from ${websocketUrl}. Clean close: ${event.wasClean}, Code: ${event.code}, Reason: '${event.reason}'`);
-        // Attempt to log specific error if available (might be limited by browser security)
-        if (!event.wasClean) {
-          console.error('WebSocket closed unexpectedly.');
+
+    this.clearReconnectTimer = () => {
+      if (this.wsReconnectTimer) {
+        clearTimeout(this.wsReconnectTimer);
+        this.wsReconnectTimer = null;
+      }
+    };
+
+    this.forceReconnect = (reason) => {
+      if (!this.wsShouldReconnect) return;
+      debugLog(`♻️ Forcing WebSocket reconnect: ${reason}`);
+      this.wsConnectInProgress = false;
+      if (this.wsDisconnectedSince === null) {
+        this.wsDisconnectedSince = Date.now();
+      }
+      if (this.websocket) {
+        try {
+          this.websocket.onopen = null;
+          this.websocket.onerror = null;
+          this.websocket.onclose = null;
+          this.websocket.onmessage = null;
+          this.websocket.close();
+        } catch (e) {
+          // ignore close errors
         }
-        this.websocket = null; // Clear the reference
-        this.reportVRStatus(false);
-      };
-      this.websocket.onmessage = (event) => {
-        console.log(`WebSocket message received: ${event.data}`); // Log any messages from server
-      };
-    } catch (error) {
+      }
+      this.websocket = null;
+      this.reportVRStatus(false);
+      this.scheduleReconnect();
+    };
+
+    this.safeSendJson = (payload, label) => {
+      if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) return false;
+      try {
+        this.websocket.send(JSON.stringify(payload));
+        return true;
+      } catch (error) {
+        debugLog(`❌ WebSocket send failed (${label}): ${error.message}`);
+        console.error(`WebSocket send failed (${label}):`, error);
+        this.forceReconnect(`send-failure:${label}`);
+        return false;
+      }
+    };
+
+    this.scheduleReconnect = () => {
+      if (!this.wsShouldReconnect) return;
+      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) return;
+      if (this.wsReconnectTimer) return;
+      const delay = Math.min(this.wsMaxReconnectDelayMs, 500 * Math.pow(2, this.wsReconnectAttempt));
+      this.wsReconnectAttempt += 1;
+      debugLog(`🔄 WebSocket reconnect in ${delay}ms`);
+      this.wsReconnectTimer = setTimeout(() => {
+        this.wsReconnectTimer = null;
+        this.connectWebSocket();
+      }, delay);
+    };
+
+    this.connectWebSocket = () => {
+      if (!this.wsShouldReconnect) return;
+      if (this.wsConnectInProgress) return;
+      if (this.websocket && (this.websocket.readyState === WebSocket.OPEN || this.websocket.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      this.wsConnectInProgress = true;
+      this.wsConnectStartedAt = Date.now();
+      this.clearReconnectTimer();
+      try {
+        this.websocket = new WebSocket(this.websocketUrl);
+        this.websocket.onopen = (event) => {
+          this.wsConnectInProgress = false;
+          this.wsConnectStartedAt = 0;
+          this.wsReconnectAttempt = 0;
+          this.wsDisconnectedSince = null;
+          debugLog(`✅ WebSocket connected!`);
+          console.log(`WebSocket connected to ${this.websocketUrl}`);
+          this.reportVRStatus(true);
+        };
+        this.websocket.onerror = (event) => {
+          debugLog(`❌ WebSocket Error: ${event.type}`);
+          console.error(`WebSocket Error: Event type: ${event.type}`, event);
+          this.reportVRStatus(false);
+        };
+        this.websocket.onclose = (event) => {
+          this.wsConnectInProgress = false;
+          this.wsConnectStartedAt = 0;
+          if (this.wsDisconnectedSince === null) {
+            this.wsDisconnectedSince = Date.now();
+          }
+          debugLog(`❌ WebSocket closed: ${event.code}`);
+          console.log(`WebSocket disconnected from ${this.websocketUrl}. Clean close: ${event.wasClean}, Code: ${event.code}, Reason: '${event.reason}'`);
+          if (!event.wasClean) {
+            console.error('WebSocket closed unexpectedly.');
+          }
+          this.websocket = null;
+          this.reportVRStatus(false);
+          this.scheduleReconnect();
+        };
+        this.websocket.onmessage = (event) => {
+          console.log(`WebSocket message received: ${event.data}`);
+        };
+      } catch (error) {
+        this.wsConnectInProgress = false;
+        this.wsConnectStartedAt = 0;
+        if (this.wsDisconnectedSince === null) {
+          this.wsDisconnectedSince = Date.now();
+        }
         debugLog(`❌ WebSocket error: ${error.message}`);
-        console.error(`Failed to create WebSocket connection to ${websocketUrl}:`, error);
+        console.error(`Failed to create WebSocket connection to ${this.websocketUrl}:`, error);
         this.reportVRStatus(false);
-    }
+        this.scheduleReconnect();
+      }
+    };
+
+    this.probeBackendAndRecover = async () => {
+      if (!this.wsShouldReconnect) return;
+      if (this.backendProbeInFlight) return;
+      this.backendProbeInFlight = true;
+      let backendReady = false;
+      try {
+        try {
+          const resp = await fetch(`/api/status?_t=${Date.now()}`, { cache: 'no-store' });
+          backendReady = !!resp.ok;
+        } catch (e) {
+          backendReady = false;
+        }
+
+        if (!backendReady) {
+          return;
+        }
+
+        const nowMs = Date.now();
+        if ((nowMs - this.lastWsPortRefreshMs) >= this.wsPortRefreshIntervalMs) {
+          this.lastWsPortRefreshMs = nowMs;
+          try {
+            const cfgResp = await fetch(`/api/config?_t=${nowMs}`, { cache: 'no-store' });
+            if (cfgResp.ok) {
+              const cfg = await cfgResp.json();
+              const cfgWsPort = parseInt(cfg?.network?.websocket_port, 10);
+              if (Number.isFinite(cfgWsPort) && cfgWsPort > 0 && cfgWsPort !== this.websocketPort) {
+                this.websocketPort = cfgWsPort;
+                this.persistWebSocketPort();
+                this.updateWebSocketUrl();
+                this.forceReconnect('ws-port-updated');
+                return;
+              }
+            }
+          } catch (e) {
+            // ignore config refresh failures
+          }
+        }
+
+        const wsOpen = !!(this.websocket && this.websocket.readyState === WebSocket.OPEN);
+        if (!wsOpen) {
+          this.connectWebSocket();
+        }
+
+        const disconnectedForMs = this.wsDisconnectedSince ? (Date.now() - this.wsDisconnectedSince) : 0;
+        const reloadCooldownMs = 60000;
+        if (
+          !wsOpen &&
+          disconnectedForMs > this.wsAutoReloadDelayMs &&
+          (Date.now() - this.wsLastAutoReloadMs) > reloadCooldownMs
+        ) {
+          this.wsLastAutoReloadMs = Date.now();
+          debugLog('🔄 Backend is back but WS still down, auto-reloading page...');
+          window.location.reload();
+        }
+      } finally {
+        this.backendProbeInFlight = false;
+      }
+    };
+
+    this.connectWebSocket();
+    this.backendProbeTimer = setInterval(() => {
+      this.probeBackendAndRecover();
+    }, this.backendProbeIntervalMs);
     // --- End WebSocket Setup ---
+
+    this.handleOnline = () => {
+      this.connectWebSocket();
+    };
+    this.handleBackendReady = () => {
+      this.connectWebSocket();
+    };
+    this.handleVisibilityChange = () => {
+      if (!document.hidden) {
+        this.connectWebSocket();
+      }
+    };
+    window.addEventListener('online', this.handleOnline);
+    window.addEventListener('telegrip-backend-ready', this.handleBackendReady);
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
 
     // --- VR Status Reporting Function ---
     this.reportVRStatus = (connected) => {
@@ -150,30 +361,29 @@ AFRAME.registerComponent('controller-updater', {
     const textRotation = '-90 0 0'; // Rotate -90 degrees around X-axis
     if (this.leftHandInfoText) this.leftHandInfoText.setAttribute('rotation', textRotation);
     if (this.rightHandInfoText) this.rightHandInfoText.setAttribute('rotation', textRotation);
+    debugLog(`🧭 Controller frame correction(deg): ${this.controllerFrameCorrectionRotationString}`);
 
     // --- Create axis indicators ---
     this.createAxisIndicators();
 
     // --- Helper function to send grip release message ---
     this.sendGripRelease = (hand) => {
-      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-        const releaseMessage = {
-          hand: hand,
-          gripReleased: true
-        };
-        this.websocket.send(JSON.stringify(releaseMessage));
+      const releaseMessage = {
+        hand: hand,
+        gripReleased: true
+      };
+      if (this.safeSendJson(releaseMessage, `grip-release:${hand}`)) {
         console.log(`Sent grip release for ${hand} hand`);
       }
     };
 
     // --- Helper function to send trigger release message ---
     this.sendTriggerRelease = (hand) => {
-      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-        const releaseMessage = {
-          hand: hand,
-          triggerReleased: true
-        };
-        this.websocket.send(JSON.stringify(releaseMessage));
+      const releaseMessage = {
+        hand: hand,
+        triggerReleased: true
+      };
+      if (this.safeSendJson(releaseMessage, `trigger-release:${hand}`)) {
         console.log(`Sent trigger release for ${hand} hand`);
       }
     };
@@ -230,6 +440,36 @@ AFRAME.registerComponent('controller-updater', {
       return degrees;
     };
 
+    this.correctControllerQuaternion = (quatLike) => {
+      if (!quatLike) return null;
+      const raw = quatLike.isQuaternion
+        ? quatLike.clone()
+        : new THREE.Quaternion(
+            Number(quatLike.x || 0),
+            Number(quatLike.y || 0),
+            Number(quatLike.z || 0),
+            Number(quatLike.w || 1),
+          );
+      if (!Number.isFinite(raw.x) || !Number.isFinite(raw.y) || !Number.isFinite(raw.z) || !Number.isFinite(raw.w)) {
+        return null;
+      }
+      if (raw.lengthSq() < 1e-12) return null;
+      raw.normalize();
+      // Apply local-frame correction after tracked controller orientation.
+      return raw.multiply(this.controllerFrameCorrectionQuat).normalize();
+    };
+
+    this.correctControllerEulerDeg = (quatLike) => {
+      const q = this.correctControllerQuaternion(quatLike);
+      if (!q) return { x: 0, y: 0, z: 0 };
+      const e = new THREE.Euler().setFromQuaternion(q, 'XYZ');
+      return {
+        x: THREE.MathUtils.radToDeg(e.x),
+        y: THREE.MathUtils.radToDeg(e.y),
+        z: THREE.MathUtils.radToDeg(e.z),
+      };
+    };
+
     // --- Modify Event Listeners ---
     this.leftHand.addEventListener('triggerdown', (evt) => {
         console.log('Left Trigger Pressed');
@@ -246,15 +486,16 @@ AFRAME.registerComponent('controller-updater', {
         
         // Store initial rotation for relative tracking
         if (this.leftHand.object3D.visible) {
-          const leftRotEuler = this.leftHand.object3D.rotation;
+          const leftCorrectedQuat = this.correctControllerQuaternion(this.leftHand.object3D.quaternion);
+          const leftRotEuler = this.correctControllerEulerDeg(this.leftHand.object3D.quaternion);
           this.leftGripInitialRotation = {
-            x: THREE.MathUtils.radToDeg(leftRotEuler.x),
-            y: THREE.MathUtils.radToDeg(leftRotEuler.y),
-            z: THREE.MathUtils.radToDeg(leftRotEuler.z)
+            x: leftRotEuler.x,
+            y: leftRotEuler.y,
+            z: leftRotEuler.z
           };
           
           // Store initial quaternion for Z-axis rotation tracking
-          this.leftGripInitialQuaternion = this.leftHand.object3D.quaternion.clone();
+          this.leftGripInitialQuaternion = leftCorrectedQuat ? leftCorrectedQuat.clone() : null;
           
           console.log('Left grip initial rotation:', this.leftGripInitialRotation);
           console.log('Left grip initial quaternion:', this.leftGripInitialQuaternion);
@@ -297,15 +538,16 @@ AFRAME.registerComponent('controller-updater', {
         
         // Store initial rotation for relative tracking
         if (this.rightHand.object3D.visible) {
-          const rightRotEuler = this.rightHand.object3D.rotation;
+          const rightCorrectedQuat = this.correctControllerQuaternion(this.rightHand.object3D.quaternion);
+          const rightRotEuler = this.correctControllerEulerDeg(this.rightHand.object3D.quaternion);
           this.rightGripInitialRotation = {
-            x: THREE.MathUtils.radToDeg(rightRotEuler.x),
-            y: THREE.MathUtils.radToDeg(rightRotEuler.y),
-            z: THREE.MathUtils.radToDeg(rightRotEuler.z)
+            x: rightRotEuler.x,
+            y: rightRotEuler.y,
+            z: rightRotEuler.z
           };
           
           // Store initial quaternion for Z-axis rotation tracking
-          this.rightGripInitialQuaternion = this.rightHand.object3D.quaternion.clone();
+          this.rightGripInitialQuaternion = rightCorrectedQuat ? rightCorrectedQuat.clone() : null;
           
           console.log('Right grip initial rotation:', this.rightGripInitialRotation);
           console.log('Right grip initial quaternion:', this.rightGripInitialQuaternion);
@@ -338,6 +580,17 @@ AFRAME.registerComponent('controller-updater', {
 
   createAxisIndicators: function() {
     // Create XYZ axis indicators for both controllers
+    const leftAxisRoot = document.createElement('a-entity');
+    leftAxisRoot.setAttribute('id', 'leftAxisRoot');
+    leftAxisRoot.setAttribute('rotation', this.controllerFrameCorrectionRotationString || '0 0 0');
+    this.leftHand.appendChild(leftAxisRoot);
+    this.leftAxisRoot = leftAxisRoot;
+
+    const rightAxisRoot = document.createElement('a-entity');
+    rightAxisRoot.setAttribute('id', 'rightAxisRoot');
+    rightAxisRoot.setAttribute('rotation', this.controllerFrameCorrectionRotationString || '0 0 0');
+    this.rightHand.appendChild(rightAxisRoot);
+    this.rightAxisRoot = rightAxisRoot;
     
     // Left Controller Axes
     // X-axis (Red)
@@ -348,7 +601,7 @@ AFRAME.registerComponent('controller-updater', {
     leftXAxis.setAttribute('color', '#ff0000'); // Red for X
     leftXAxis.setAttribute('position', '0.04 0 0');
     leftXAxis.setAttribute('rotation', '0 0 90'); // Rotate to point along X-axis
-    this.leftHand.appendChild(leftXAxis);
+    this.leftAxisRoot.appendChild(leftXAxis);
 
     const leftXTip = document.createElement('a-cone');
     leftXTip.setAttribute('height', '0.015');
@@ -357,7 +610,7 @@ AFRAME.registerComponent('controller-updater', {
     leftXTip.setAttribute('color', '#ff0000');
     leftXTip.setAttribute('position', '0.055 0 0');
     leftXTip.setAttribute('rotation', '0 0 90');
-    this.leftHand.appendChild(leftXTip);
+    this.leftAxisRoot.appendChild(leftXTip);
 
     // Y-axis (Green) - Up
     const leftYAxis = document.createElement('a-cylinder');
@@ -367,7 +620,7 @@ AFRAME.registerComponent('controller-updater', {
     leftYAxis.setAttribute('color', '#00ff00'); // Green for Y
     leftYAxis.setAttribute('position', '0 0.04 0');
     leftYAxis.setAttribute('rotation', '0 0 0'); // Default up orientation
-    this.leftHand.appendChild(leftYAxis);
+    this.leftAxisRoot.appendChild(leftYAxis);
 
     const leftYTip = document.createElement('a-cone');
     leftYTip.setAttribute('height', '0.015');
@@ -375,7 +628,7 @@ AFRAME.registerComponent('controller-updater', {
     leftYTip.setAttribute('radius-top', '0');
     leftYTip.setAttribute('color', '#00ff00');
     leftYTip.setAttribute('position', '0 0.055 0');
-    this.leftHand.appendChild(leftYTip);
+    this.leftAxisRoot.appendChild(leftYTip);
 
     // Z-axis (Blue) - Forward
     const leftZAxis = document.createElement('a-cylinder');
@@ -385,7 +638,7 @@ AFRAME.registerComponent('controller-updater', {
     leftZAxis.setAttribute('color', '#0000ff'); // Blue for Z
     leftZAxis.setAttribute('position', '0 0 0.04');
     leftZAxis.setAttribute('rotation', '90 0 0'); // Rotate to point along Z-axis
-    this.leftHand.appendChild(leftZAxis);
+    this.leftAxisRoot.appendChild(leftZAxis);
 
     const leftZTip = document.createElement('a-cone');
     leftZTip.setAttribute('height', '0.015');
@@ -394,7 +647,7 @@ AFRAME.registerComponent('controller-updater', {
     leftZTip.setAttribute('color', '#0000ff');
     leftZTip.setAttribute('position', '0 0 0.055');
     leftZTip.setAttribute('rotation', '90 0 0');
-    this.leftHand.appendChild(leftZTip);
+    this.leftAxisRoot.appendChild(leftZTip);
 
     // Right Controller Axes
     // X-axis (Red)
@@ -405,7 +658,7 @@ AFRAME.registerComponent('controller-updater', {
     rightXAxis.setAttribute('color', '#ff0000'); // Red for X
     rightXAxis.setAttribute('position', '0.04 0 0');
     rightXAxis.setAttribute('rotation', '0 0 90'); // Rotate to point along X-axis
-    this.rightHand.appendChild(rightXAxis);
+    this.rightAxisRoot.appendChild(rightXAxis);
 
     const rightXTip = document.createElement('a-cone');
     rightXTip.setAttribute('height', '0.015');
@@ -414,7 +667,7 @@ AFRAME.registerComponent('controller-updater', {
     rightXTip.setAttribute('color', '#ff0000');
     rightXTip.setAttribute('position', '0.055 0 0');
     rightXTip.setAttribute('rotation', '0 0 90');
-    this.rightHand.appendChild(rightXTip);
+    this.rightAxisRoot.appendChild(rightXTip);
 
     // Y-axis (Green) - Up
     const rightYAxis = document.createElement('a-cylinder');
@@ -424,7 +677,7 @@ AFRAME.registerComponent('controller-updater', {
     rightYAxis.setAttribute('color', '#00ff00'); // Green for Y
     rightYAxis.setAttribute('position', '0 0.04 0');
     rightYAxis.setAttribute('rotation', '0 0 0'); // Default up orientation
-    this.rightHand.appendChild(rightYAxis);
+    this.rightAxisRoot.appendChild(rightYAxis);
 
     const rightYTip = document.createElement('a-cone');
     rightYTip.setAttribute('height', '0.015');
@@ -432,7 +685,7 @@ AFRAME.registerComponent('controller-updater', {
     rightYTip.setAttribute('radius-top', '0');
     rightYTip.setAttribute('color', '#00ff00');
     rightYTip.setAttribute('position', '0 0.055 0');
-    this.rightHand.appendChild(rightYTip);
+    this.rightAxisRoot.appendChild(rightYTip);
 
     // Z-axis (Blue) - Forward
     const rightZAxis = document.createElement('a-cylinder');
@@ -442,7 +695,7 @@ AFRAME.registerComponent('controller-updater', {
     rightZAxis.setAttribute('color', '#0000ff'); // Blue for Z
     rightZAxis.setAttribute('position', '0 0 0.04');
     rightZAxis.setAttribute('rotation', '90 0 0'); // Rotate to point along Z-axis
-    this.rightHand.appendChild(rightZAxis);
+    this.rightAxisRoot.appendChild(rightZAxis);
 
     const rightZTip = document.createElement('a-cone');
     rightZTip.setAttribute('height', '0.015');
@@ -451,7 +704,7 @@ AFRAME.registerComponent('controller-updater', {
     rightZTip.setAttribute('color', '#0000ff');
     rightZTip.setAttribute('position', '0 0 0.055');
     rightZTip.setAttribute('rotation', '90 0 0');
-    this.rightHand.appendChild(rightZTip);
+    this.rightAxisRoot.appendChild(rightZTip);
 
     console.log('XYZ axis indicators created for both controllers (RGB for XYZ)');
   },
@@ -497,6 +750,21 @@ AFRAME.registerComponent('controller-updater', {
   },
 
   tick: function () {
+    const nowMs = Date.now();
+    if (
+      this.websocket &&
+      this.websocket.readyState === WebSocket.CONNECTING &&
+      this.wsConnectStartedAt > 0 &&
+      (nowMs - this.wsConnectStartedAt) > this.wsConnectTimeoutMs
+    ) {
+      this.forceReconnect('connect-timeout');
+    }
+
+    if ((nowMs - this.lastBackendProbeMs) >= this.backendProbeIntervalMs) {
+      this.lastBackendProbeMs = nowMs;
+      this.probeBackendAndRecover();
+    }
+
     // Update controller text if controllers are visible
     if (!this.leftHand || !this.rightHand) return; // Added safety check
 
@@ -546,11 +814,11 @@ AFRAME.registerComponent('controller-updater', {
     // Update Left Hand Text & Collect Data
     if (this.leftHand && this.leftHand.object3D) {
         const leftPos = this.leftHand.object3D.position;
-        const leftRotEuler = this.leftHand.object3D.rotation; // Euler angles in radians
-        // Convert to degrees without offset
-        const leftRotX = THREE.MathUtils.radToDeg(leftRotEuler.x);
-        const leftRotY = THREE.MathUtils.radToDeg(leftRotEuler.y);
-        const leftRotZ = THREE.MathUtils.radToDeg(leftRotEuler.z);
+        const leftCorrectedQuat = this.correctControllerQuaternion(this.leftHand.object3D.quaternion);
+        const leftRotEuler = this.correctControllerEulerDeg(this.leftHand.object3D.quaternion);
+        const leftRotX = leftRotEuler.x;
+        const leftRotY = leftRotEuler.y;
+        const leftRotZ = leftRotEuler.z;
 
         // Calculate relative rotation if grip is held
         if (this.leftGripDown && this.leftGripInitialRotation) {
@@ -560,9 +828,9 @@ AFRAME.registerComponent('controller-updater', {
           );
           
           // Calculate Z-axis rotation using quaternions
-          if (this.leftGripInitialQuaternion) {
+          if (this.leftGripInitialQuaternion && leftCorrectedQuat) {
             this.leftZAxisRotation = this.calculateZAxisRotation(
-              this.leftHand.object3D.quaternion,
+              leftCorrectedQuat,
               this.leftGripInitialQuaternion
             );
           }
@@ -584,12 +852,14 @@ AFRAME.registerComponent('controller-updater', {
         // Collect left controller data
         leftController.position = { x: leftPos.x, y: leftPos.y, z: leftPos.z };
         leftController.rotation = { x: leftRotX, y: leftRotY, z: leftRotZ };
-        leftController.quaternion = { 
-          x: this.leftHand.object3D.quaternion.x, 
-          y: this.leftHand.object3D.quaternion.y, 
-          z: this.leftHand.object3D.quaternion.z, 
-          w: this.leftHand.object3D.quaternion.w 
-        };
+        if (leftCorrectedQuat) {
+          leftController.quaternion = {
+            x: leftCorrectedQuat.x,
+            y: leftCorrectedQuat.y,
+            z: leftCorrectedQuat.z,
+            w: leftCorrectedQuat.w
+          };
+        }
         leftController.trigger = this.leftTriggerDown ? 1 : 0;
         leftController.x = this.leftXDown ? 1 : 0;
         leftController.gripActive = this.leftGripDown;
@@ -599,11 +869,11 @@ AFRAME.registerComponent('controller-updater', {
     // Update Right Hand Text & Collect Data
     if (this.rightHand && this.rightHand.object3D) {
         const rightPos = this.rightHand.object3D.position;
-        const rightRotEuler = this.rightHand.object3D.rotation; // Euler angles in radians
-        // Convert to degrees without offset
-        const rightRotX = THREE.MathUtils.radToDeg(rightRotEuler.x);
-        const rightRotY = THREE.MathUtils.radToDeg(rightRotEuler.y);
-        const rightRotZ = THREE.MathUtils.radToDeg(rightRotEuler.z);
+        const rightCorrectedQuat = this.correctControllerQuaternion(this.rightHand.object3D.quaternion);
+        const rightRotEuler = this.correctControllerEulerDeg(this.rightHand.object3D.quaternion);
+        const rightRotX = rightRotEuler.x;
+        const rightRotY = rightRotEuler.y;
+        const rightRotZ = rightRotEuler.z;
 
         // Calculate relative rotation if grip is held
         if (this.rightGripDown && this.rightGripInitialRotation) {
@@ -613,9 +883,9 @@ AFRAME.registerComponent('controller-updater', {
           );
           
           // Calculate Z-axis rotation using quaternions
-          if (this.rightGripInitialQuaternion) {
+          if (this.rightGripInitialQuaternion && rightCorrectedQuat) {
             this.rightZAxisRotation = this.calculateZAxisRotation(
-              this.rightHand.object3D.quaternion,
+              rightCorrectedQuat,
               this.rightGripInitialQuaternion
             );
           }
@@ -637,12 +907,14 @@ AFRAME.registerComponent('controller-updater', {
         // Collect right controller data
         rightController.position = { x: rightPos.x, y: rightPos.y, z: rightPos.z };
         rightController.rotation = { x: rightRotX, y: rightRotY, z: rightRotZ };
-        rightController.quaternion = { 
-          x: this.rightHand.object3D.quaternion.x, 
-          y: this.rightHand.object3D.quaternion.y, 
-          z: this.rightHand.object3D.quaternion.z, 
-          w: this.rightHand.object3D.quaternion.w 
-        };
+        if (rightCorrectedQuat) {
+          rightController.quaternion = {
+            x: rightCorrectedQuat.x,
+            y: rightCorrectedQuat.y,
+            z: rightCorrectedQuat.z,
+            w: rightCorrectedQuat.w
+          };
+        }
         rightController.trigger = this.rightTriggerDown ? 1 : 0;
         rightController.a = this.rightADown ? 1 : 0;
         rightController.gripActive = this.rightGripDown;
@@ -661,9 +933,38 @@ AFRAME.registerComponent('controller-updater', {
                 leftController: leftController,
                 rightController: rightController
             };
-            this.websocket.send(JSON.stringify(dualControllerData));
+            this.safeSendJson(dualControllerData, 'dual-controller-data');
         }
     }
+  }
+,
+  remove: function () {
+    this.wsShouldReconnect = false;
+    if (this.handleOnline) {
+      window.removeEventListener('online', this.handleOnline);
+    }
+    if (this.handleBackendReady) {
+      window.removeEventListener('telegrip-backend-ready', this.handleBackendReady);
+    }
+    if (this.handleVisibilityChange) {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    if (this.backendProbeTimer) {
+      clearInterval(this.backendProbeTimer);
+      this.backendProbeTimer = null;
+    }
+    if (this.websocket && (this.websocket.readyState === WebSocket.OPEN || this.websocket.readyState === WebSocket.CONNECTING)) {
+      try {
+        this.websocket.close();
+      } catch (e) {
+        // ignore
+      }
+    }
+    this.websocket = null;
   }
 });
 

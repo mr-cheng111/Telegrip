@@ -42,7 +42,25 @@ function populateSettingsForm(config) {
   document.getElementById('sendInterval').value = (config.robot?.send_interval * 1000) || ''; // Convert to ms
 }
 
-function restartSystem() {
+function sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForBackendReady(maxWaitMs = 90000, intervalMs = 1500) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const resp = await fetch(`/api/status?_t=${Date.now()}`, { cache: 'no-store' });
+      if (resp.ok) return true;
+    } catch (e) {
+      // backend is still restarting
+    }
+    await sleepMs(intervalMs);
+  }
+  return false;
+}
+
+async function restartSystem() {
   if (!confirm('Are you sure you want to restart the system? This will temporarily disconnect all devices.')) {
     return;
   }
@@ -51,34 +69,39 @@ function restartSystem() {
   restartButton.disabled = true;
   restartButton.textContent = 'Restarting...';
 
-  fetch('/api/restart', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    }
-  })
-  .then(response => {
-    if (response.ok) {
-      // Show restart message and close modal
-      alert('System is restarting... The page will reload automatically in a few seconds.');
-      closeSettings();
-      
-      // Try to reconnect after a delay
-      setTimeout(() => {
-        window.location.reload();
-      }, 5000);
-    } else {
+  try {
+    const response = await fetch('/api/restart', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      cache: 'no-store'
+    });
+
+    if (!response.ok) {
       alert('Failed to restart system. Please restart manually.');
+      return;
     }
-  })
-  .catch(error => {
+
+    alert('System is restarting... The page will reconnect automatically.');
+    closeSettings();
+
+    // Give backend a brief moment to tear down.
+    await sleepMs(1200);
+    const ready = await waitForBackendReady();
+    if (ready) {
+      updateStatus();
+      window.dispatchEvent(new CustomEvent('telegrip-backend-ready'));
+    } else {
+      alert('Backend did not come back in time. Please keep this page open and check the terminal logs.');
+    }
+  } catch (error) {
     console.error('Error restarting system:', error);
     alert('Error communicating with server. Please restart manually.');
-  })
-  .finally(() => {
+  } finally {
     restartButton.disabled = false;
     restartButton.textContent = '🔄 Restart System';
-  });
+  }
 }
 
 function saveConfiguration() {
@@ -137,7 +160,7 @@ function saveConfiguration() {
 
 // Update status indicators
 function updateStatus() {
-  fetch('/api/status')
+  fetch(`/api/status?_t=${Date.now()}`, { cache: 'no-store' })
     .then(response => response.json())
     .then(data => {
       // Update arm connection indicators (based on device files)

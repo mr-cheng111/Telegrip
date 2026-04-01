@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 class MuJoCoVisualizer:
     """MuJoCo-based visualization for dual-arm robot teleoperation."""
     
-    def __init__(self, scene_xml_path: str, use_gui: bool = True, log_level: str = "warning"):
+    def __init__(
+        self,
+        scene_xml_path: str,
+        use_gui: bool = True,
+        log_level: str = "warning",
+        startup_arm_pose_deg: Optional[Dict[str, np.ndarray]] = None,
+    ):
         """
         Initialize MuJoCo visualizer.
         
@@ -24,6 +30,7 @@ class MuJoCoVisualizer:
             scene_xml_path: Path to MuJoCo scene XML file (should contain both robot arms)
             use_gui: Whether to show GUI (if False, runs headless)
             log_level: Logging level
+            startup_arm_pose_deg: Optional startup pose {"left": deg[6], "right": deg[6]}
         """
         self.scene_xml_path = Path(scene_xml_path)
         self.use_gui = use_gui
@@ -77,6 +84,7 @@ class MuJoCoVisualizer:
         self.kd = np.array([10.0, 30.0, 10.0, 1.5, 1.0, 1.0])
         self.torque_limits = np.array([49.0, 49.0, 49.0, 9.0, 9.0, 9.0])
         self.use_gravity_compensation = True
+        self.startup_arm_pose_deg = startup_arm_pose_deg
     
     def setup(self) -> bool:
         """Initialize MuJoCo and optionally launch viewer."""
@@ -90,6 +98,13 @@ class MuJoCoVisualizer:
             
             # Read joint limits
             self._read_joint_limits()
+
+            # Optionally align initial MuJoCo posture with externally sampled joint_state.
+            if isinstance(self.startup_arm_pose_deg, dict):
+                left = self.startup_arm_pose_deg.get("left")
+                right = self.startup_arm_pose_deg.get("right")
+                if left is not None and right is not None:
+                    self._apply_initial_arm_pose_deg(left, right)
             
             # Launch viewer if GUI enabled
             if self.use_gui:
@@ -284,27 +299,34 @@ class MuJoCoVisualizer:
             incoming = np.asarray(joint_angles_deg[:self.num_joints], dtype=float)
             self.desired_joint_angles_deg[arm] = incoming.copy()
 
+    def _apply_initial_arm_pose_deg(self, left_angles_deg: np.ndarray, right_angles_deg: np.ndarray) -> bool:
+        """Apply arm posture directly into MuJoCo qpos + desired targets."""
+        if self.model is None or self.data is None:
+            return False
+
+        l_qidx = self.joint_qpos_indices.get("left")
+        r_qidx = self.joint_qpos_indices.get("right")
+        if l_qidx is None or r_qidx is None:
+            return False
+
+        l = np.asarray(left_angles_deg[:self.num_joints], dtype=float)
+        r = np.asarray(right_angles_deg[:self.num_joints], dtype=float)
+        if l.size < self.num_joints or r.size < self.num_joints:
+            return False
+
+        self.data.qvel[:] = 0.0
+        self.data.qpos[l_qidx] = np.deg2rad(l)
+        self.data.qpos[r_qidx] = np.deg2rad(r)
+        mujoco.mj_forward(self.model, self.data)
+
+        self.desired_joint_angles_deg["left"] = l.copy()
+        self.desired_joint_angles_deg["right"] = r.copy()
+        return True
+
     def set_initial_arm_pose_deg(self, left_angles_deg: np.ndarray, right_angles_deg: np.ndarray):
         """Set initial arm posture directly in MuJoCo state and desired targets."""
-        if not self.is_connected:
-            return
-
         with self._mujoco_lock:
-            l_qidx = self.joint_qpos_indices.get("left")
-            r_qidx = self.joint_qpos_indices.get("right")
-            if l_qidx is None or r_qidx is None:
-                return
-
-            l = np.asarray(left_angles_deg[:self.num_joints], dtype=float)
-            r = np.asarray(right_angles_deg[:self.num_joints], dtype=float)
-
-            self.data.qvel[:] = 0.0
-            self.data.qpos[l_qidx] = np.deg2rad(l)
-            self.data.qpos[r_qidx] = np.deg2rad(r)
-            mujoco.mj_forward(self.model, self.data)
-
-            self.desired_joint_angles_deg["left"] = l.copy()
-            self.desired_joint_angles_deg["right"] = r.copy()
+            self._apply_initial_arm_pose_deg(left_angles_deg, right_angles_deg)
     
     def _resolve_mocap_id(self, marker_name: str) -> Optional[int]:
         """Resolve marker name to a mocap body id with single-arm fallbacks."""

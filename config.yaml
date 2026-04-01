@@ -31,6 +31,7 @@ control:
   use_mink: true
   vr:
     enabled: true
+    orientation_reference_mode: grip_press # grip_press global_calibration
     orientation_reference_quat_xyzw:
       left:
       - 0

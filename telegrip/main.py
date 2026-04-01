@@ -83,6 +83,9 @@ def create_config_from_args(args) -> TelegripConfig:
 
     config.enable_keyboard = False
     config.enable_vr = bool(vr_cfg.get("enabled", config.enable_vr))
+    config.vr_orientation_reference_mode = str(
+        vr_cfg.get("orientation_reference_mode", config.vr_orientation_reference_mode)
+    )
     config.enable_gui = bool(control_cfg.get("enable_gui", config.enable_gui))
     config.enable_sim = bool(control_cfg.get("enable_sim", config.enable_sim))
     # If simulation is disabled, GUI must also be disabled.

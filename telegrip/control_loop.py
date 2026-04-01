@@ -113,12 +113,75 @@ class ControlLoop:
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             dtype=float,
         )
+        # Guard to ensure startup joint_state->MuJoCo alignment runs only once.
+        self._startup_joint_state_initialized = False
+
+    @staticmethod
+    def _joint_state_to_degrees(raw_angles: np.ndarray) -> Optional[np.ndarray]:
+        """Validate startup joint_state snapshot values (already in degrees)."""
+        arr = np.asarray(raw_angles, dtype=float).reshape(-1)
+        if arr.size < NUM_JOINTS:
+            return None
+        arr = arr[:NUM_JOINTS]
+        if not np.all(np.isfinite(arr)):
+            return None
+        return arr.copy()
+
+    def _collect_startup_joint_state_pose_deg(self, timeout_s: float = 3.0) -> Optional[Dict[str, np.ndarray]]:
+        """Fetch one startup joint_state snapshot and convert to degree pose."""
+        if self._startup_joint_state_initialized:
+            return None
+        self._startup_joint_state_initialized = True
+
+        if not self.robot_interface:
+            return None
+
+        snapshot = self.robot_interface.wait_for_joint_state_snapshot(timeout_s=timeout_s)
+        if not snapshot:
+            logger.info("Startup joint_state snapshot unavailable; keeping MuJoCo default initial pose")
+            return None
+
+        pose_deg: Dict[str, np.ndarray] = {}
+        for arm in ("left", "right"):
+            raw = snapshot.get(arm)
+            if raw is None:
+                continue
+            converted = self._joint_state_to_degrees(raw)
+            if converted is not None:
+                pose_deg[arm] = converted
+
+        if not pose_deg:
+            logger.warning("Startup joint_state snapshot received but could not parse joint values")
+            return None
+
+        logger.info(
+            "Startup joint_state snapshot captured for arms: "
+            + ", ".join(sorted(pose_deg.keys()))
+        )
+        return pose_deg
+
+    def _seed_robot_state_from_pose_deg(self, left_deg: np.ndarray, right_deg: np.ndarray):
+        """Seed robot interface commanded/simulated states from startup pose."""
+        if not self.robot_interface:
+            return
+
+        l = np.asarray(left_deg[:NUM_JOINTS], dtype=float).copy()
+        r = np.asarray(right_deg[:NUM_JOINTS], dtype=float).copy()
+        self.robot_interface.left_arm_angles = l.copy()
+        self.robot_interface.right_arm_angles = r.copy()
+        self.robot_interface.set_simulated_arm_angles("left", l)
+        self.robot_interface.set_simulated_arm_angles("right", r)
+
+        if self.robot_interface.ros_node is not None:
+            self.robot_interface.ros_node.left_arm_angles = l.copy()
+            self.robot_interface.ros_node.right_arm_angles = r.copy()
 
     
     def setup(self) -> bool:
         """Setup robot interface and visualizer."""
         success = True
         setup_errors = []
+        startup_joint_pose_deg = None
         
         # Setup robot interface
         try:
@@ -140,6 +203,13 @@ class ControlLoop:
             setup_errors.append(error_msg)
             if self.config.enable_robot:
                 success = False
+
+        # Capture startup joint_state once so MuJoCo can start from real arm pose.
+        try:
+            startup_joint_pose_deg = self._collect_startup_joint_state_pose_deg(timeout_s=3.0)
+        except Exception as e:
+            logger.warning(f"Failed to capture startup joint_state snapshot: {e}")
+            startup_joint_pose_deg = None
         
         # Setup Mink+MuJoCo visualization and IK
         # Always try to use Mink unless explicitly disabled
@@ -188,10 +258,19 @@ class ControlLoop:
             else:
                 visualizer_scene_path = kinematics_scene_path
             
+            visualizer_startup_pose = None
+            if (
+                isinstance(startup_joint_pose_deg, dict)
+                and "left" in startup_joint_pose_deg
+                and "right" in startup_joint_pose_deg
+            ):
+                visualizer_startup_pose = startup_joint_pose_deg
+
             self.visualizer = MuJoCoVisualizer(
                 str(visualizer_scene_path),
                 use_gui=self.config.enable_gui,
-                log_level=self.config.log_level
+                log_level=self.config.log_level,
+                startup_arm_pose_deg=visualizer_startup_pose,
             )
             if not self.visualizer.setup():
                 error_msg = "MuJoCo visualizer setup failed"
@@ -199,11 +278,28 @@ class ControlLoop:
                 setup_errors.append(error_msg)
                 self.visualizer = None
             else:
-                # Keep startup posture consistent with mink/examples/arm_arm620_dual_unified_base.py.
-                if use_unified_base_scene:
+                startup_pose_applied = False
+                if isinstance(startup_joint_pose_deg, dict) and startup_joint_pose_deg:
+                    l_pose = startup_joint_pose_deg.get("left")
+                    r_pose = startup_joint_pose_deg.get("right")
+                    if l_pose is None:
+                        l_pose = self.visualizer.get_joint_angles_deg("left")
+                    if r_pose is None:
+                        r_pose = self.visualizer.get_joint_angles_deg("right")
+                    if l_pose is not None and r_pose is not None:
+                        self.visualizer.set_initial_arm_pose_deg(l_pose, r_pose)
+                        self._seed_robot_state_from_pose_deg(l_pose, r_pose)
+                        startup_pose_applied = True
+                        logger.info(
+                            "Applied startup joint_state pose to MuJoCo: "
+                            f"left={np.round(l_pose, 2)}, right={np.round(r_pose, 2)}"
+                        )
+
+                # Fallback: keep unified-base default posture if no startup feedback pose.
+                if use_unified_base_scene and not startup_pose_applied:
                     # 左右臂初始角互为相反数。
                     right_initial_pose_deg = np.array([-90.0, -30.0, -90.0, -90.0, -90.0, 30.0], dtype=float)
-                    left_initial_pose_deg =  np.array([90.0, 30.0, 90.0, 90.0, 90.0, 150.0], dtype=float)
+                    left_initial_pose_deg = np.array([90.0, 30.0, 90.0, 90.0, 90.0, 150.0], dtype=float)
                     self.visualizer.set_initial_arm_pose_deg(left_initial_pose_deg, right_initial_pose_deg)
                     logger.info(
                         "Applied unified-base initial pose: "
@@ -759,10 +855,12 @@ class ControlLoop:
                             q_delta_target = self._quat_from_rotation_matrix_wxyz(
                                 R_delta_target
                             )
-                            # 固定姿态基准: 先绕 X 轴 +90°，再绕 Z 轴 -90°。
-                            # 本函数内部构造为 R = Rz(rz) * Ry(ry) * Rx(rx)，
-                            # 因此这里写 (rx=90, ry=0, rz=-90) 即可对应上述顺序。
-                            q_init = self._quat_from_euler_xyz_deg(90.0, 0.0, -90.0)
+                            # Use grip-time target orientation as baseline so there is
+                            # no hard-coded "default" target direction jump at grip press.
+                            q_init = arm_state.origin_target_orientation_quat
+                            if q_init is None:
+                                q_init = self._get_current_ee_orientation(goal.arm)
+                            q_init = self._quat_normalize_wxyz(np.asarray(q_init, dtype=float))
 
                             q_out = self._quat_multiply_wxyz(
                                 q_init,

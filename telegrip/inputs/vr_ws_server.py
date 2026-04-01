@@ -74,11 +74,15 @@ class VRWebSocketServer(BaseInputProvider):
         # Robot state tracking (for relative position calculation)
         self.left_arm_origin_position = None
         self.right_arm_origin_position = None
+        self.orientation_reference_mode = self._normalize_orientation_reference_mode(
+            getattr(self.config, "vr_orientation_reference_mode", "global_calibration")
+        )
         # Global orientation calibration references in controller quaternion order [x, y, z, w].
         self.hand_orientation_ref_xyzw = {"left": None, "right": None}
         self._load_orientation_refs_from_config()
         self._calib_hold_start_ts = None
         self._calib_hold_done = False
+        logger.info(f"VR orientation reference mode: {self.orientation_reference_mode}")
 
     @staticmethod
     def _normalize_xyzw(q: np.ndarray) -> np.ndarray:
@@ -87,6 +91,23 @@ class VRWebSocketServer(BaseInputProvider):
         if n <= 1e-12:
             return None
         return arr / n
+
+    @staticmethod
+    def _normalize_orientation_reference_mode(mode: str) -> str:
+        raw = str(mode).strip().lower()
+        if raw in ("global", "global_calibration", "calibration", "config"):
+            return "global_calibration"
+        if raw in ("grip", "grip_press", "grip_down", "grip-origin", "grip_origin"):
+            return "grip_press"
+        return "global_calibration"
+
+    def _resolve_orientation_reference_xyzw(self, hand: str, controller: VRControllerState) -> Optional[np.ndarray]:
+        """Return orientation reference according to configured mode."""
+        if self.orientation_reference_mode == "grip_press":
+            if controller.origin_quaternion is None:
+                return None
+            return self._normalize_xyzw(np.asarray(controller.origin_quaternion, dtype=float))
+        return self.hand_orientation_ref_xyzw.get(hand)
 
     def _load_orientation_refs_from_config(self):
         """Load saved orientation reference quaternions from config.yaml."""
@@ -121,6 +142,8 @@ class VRWebSocketServer(BaseInputProvider):
 
     def _update_orientation_calibration_hold(self, left_data: Dict, right_data: Dict):
         """Hold-to-calibrate: left X + right A for 3s to set orientation references."""
+        if self.orientation_reference_mode != "global_calibration":
+            return
         # Trigger-like value path (same style as trigger > 0.5), then fallbacks.
         lx = float(left_data.get("x", 0.0)) > 0.5
         ra = float(right_data.get("a", 0.0)) > 0.5
@@ -456,11 +479,11 @@ class VRWebSocketServer(BaseInputProvider):
                         float(quaternion['w']),
                     ], dtype=float))
                     if current_xyzw is not None:
-                        ref_xyzw = self.hand_orientation_ref_xyzw.get(hand)
+                        ref_xyzw = self._resolve_orientation_reference_xyzw(hand, controller)
                         if ref_xyzw is not None:
-                            # Controller local delta from calibration pose:
+                            # Controller local delta from configured reference pose:
                             # q_delta = inv(q_ref) * q_now  (xyzw)
-                            # This keeps "relative to init pose" semantics stable.
+                            # q_ref comes from global calibration or grip-press origin.
                             rel_xyzw = (
                                 R.from_quat(ref_xyzw).inv()
                                 * R.from_quat(current_xyzw)
@@ -472,7 +495,7 @@ class VRWebSocketServer(BaseInputProvider):
                                 float(rel_xyzw[2]),
                             ], dtype=float)
                         else:
-                            # Fallback before first calibration: treat current pose as relative identity.
+                            # Fallback when no reference pose is available yet.
                             marker_quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
 
                 goal = ControlGoal(
