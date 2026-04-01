@@ -1,7 +1,9 @@
 control:
+  enable_sim: true
+  enable_gui: true
   keyboard:
     angle_step: 5
-    enabled: true
+    enabled: false
     gripper_step: 10.0
     pos_step: 0.01
   mink:
@@ -26,8 +28,6 @@ control:
     posture_cost: 0.0001
     # 求解器正则阻尼（无量纲）。增大可抑制抖动与噪声放大，但跟踪会变慢。
     solve_damping: 0.00001
-  pybullet:
-    enabled: false
   use_mink: true
   vr:
     enabled: true
@@ -67,13 +67,11 @@ robot:
     enabled: true
     interface: rclpy
     name: Left ARM620
-    port: /dev/ttySO100blue
   require_state_feedback: false
   right_arm:
     enabled: true
     interface: rclpy
     name: Right ARM620
-    port: /dev/ttySO100red
   send_interval: 0.001
   vr_to_robot_scale: 1
 ssl:

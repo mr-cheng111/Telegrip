@@ -1,8 +1,6 @@
 // Global state
-let isKeyboardEnabled = false;
 let isRobotEngaged = false;
 let currentConfig = {};
-let warningTimeout = null;
 
 // Settings modal functions
 function openSettings() {
@@ -32,9 +30,7 @@ function loadConfiguration() {
 function populateSettingsForm(config) {
   // Robot arms
   document.getElementById('leftArmName').value = config.robot?.left_arm?.name || '';
-  document.getElementById('leftArmPort').value = config.robot?.left_arm?.port || '';
   document.getElementById('rightArmName').value = config.robot?.right_arm?.name || '';
-  document.getElementById('rightArmPort').value = config.robot?.right_arm?.port || '';
   
   // Network settings
   document.getElementById('httpsPort').value = config.network?.https_port || '';
@@ -44,8 +40,6 @@ function populateSettingsForm(config) {
   // Control parameters
   document.getElementById('vrScale').value = config.robot?.vr_to_robot_scale || '';
   document.getElementById('sendInterval').value = (config.robot?.send_interval * 1000) || ''; // Convert to ms
-  document.getElementById('posStep').value = config.control?.keyboard?.pos_step || '';
-  document.getElementById('angleStep').value = config.control?.keyboard?.angle_step || '';
 }
 
 function restartSystem() {
@@ -96,12 +90,10 @@ function saveConfiguration() {
     robot: {
       left_arm: {
         name: formData.get('leftArmName'),
-        port: formData.get('leftArmPort'),
         enabled: true
       },
       right_arm: {
         name: formData.get('rightArmName'),
-        port: formData.get('rightArmPort'),
         enabled: true
       },
       vr_to_robot_scale: parseFloat(formData.get('vrScale')),
@@ -111,12 +103,6 @@ function saveConfiguration() {
       https_port: parseInt(formData.get('httpsPort')),
       websocket_port: parseInt(formData.get('websocketPort')),
       host_ip: formData.get('hostIp')
-    },
-    control: {
-      keyboard: {
-        pos_step: parseFloat(formData.get('posStep')),
-        angle_step: parseFloat(formData.get('angleStep'))
-      }
     }
   };
 
@@ -162,17 +148,7 @@ function updateStatus() {
       leftIndicator.className = 'status-indicator' + (data.left_arm_connected ? ' connected' : '');
       rightIndicator.className = 'status-indicator' + (data.right_arm_connected ? ' connected' : '');
       vrIndicator.className = 'status-indicator' + (data.vrConnected ? ' connected' : '');
-      
-      // Update keyboard control status
-      isKeyboardEnabled = data.keyboardEnabled;
-      const keyboardHelp = document.querySelector('.keyboard-help');
-      
-      if (isKeyboardEnabled) {
-        if (keyboardHelp) keyboardHelp.classList.add('active');
-      } else {
-        if (keyboardHelp) keyboardHelp.classList.remove('active');
-      }
-      
+
       // Update robot engagement status
       if (data.robotEngaged !== undefined) {
         isRobotEngaged = data.robotEngaged;
@@ -208,34 +184,6 @@ function updateEngagementUI() {
   }
 }
 
-function showConnectionWarning() {
-  const engageBtn = document.getElementById('robotEngageBtn');
-  const connectionWarning = document.getElementById('connectionWarning');
-
-  if (!isRobotEngaged) {
-    // Add pulsing animation to the connect button
-    engageBtn.classList.add('needs-attention');
-
-    // Show the warning message
-    if (connectionWarning) {
-      connectionWarning.classList.add('show');
-    }
-
-    // Clear any existing timeout
-    if (warningTimeout) {
-      clearTimeout(warningTimeout);
-    }
-
-    // Hide warning and stop pulsing after 5 seconds
-    warningTimeout = setTimeout(() => {
-      engageBtn.classList.remove('needs-attention');
-      if (connectionWarning) {
-        connectionWarning.classList.remove('show');
-      }
-    }, 5000);
-  }
-}
-
 function toggleRobotEngagement() {
   const action = isRobotEngaged ? 'disconnect' : 'connect';
   
@@ -261,38 +209,6 @@ function toggleRobotEngagement() {
   });
 }
 
-// Toggle keyboard control
-function toggleKeyboardControl() {
-  const action = isKeyboardEnabled ? 'disable' : 'enable';
-  
-  fetch('/api/keyboard', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ action: action })
-  })
-  .then(response => response.json())
-  .then(data => {
-    if (data.success) {
-      isKeyboardEnabled = !isKeyboardEnabled;
-      const keyboardHelp = document.querySelector('.keyboard-help');
-      
-      if (isKeyboardEnabled) {
-        if (keyboardHelp) keyboardHelp.classList.add('active');
-      } else {
-        if (keyboardHelp) keyboardHelp.classList.remove('active');
-      }
-    } else {
-      alert('Failed to toggle keyboard control: ' + (data.error || 'Unknown error'));
-    }
-  })
-  .catch(error => {
-    console.error('Error toggling keyboard control:', error);
-    alert('Error communicating with server');
-  });
-}
-
 // Check if running in VR/AR mode
 function isVRMode() {
   return window.navigator.xr && document.fullscreenElement;
@@ -308,114 +224,6 @@ function updateUIForDevice() {
     // Always show desktop interface initially - let the start button handle VR entry
     desktopInterface.style.display = 'block';
   }
-}
-
-// Web-based keyboard control
-let pressedKeys = new Set();
-
-// Add keyboard event listeners for web-based control
-// Use capture phase to intercept keys before browser handles them (e.g., F for fullscreen)
-document.addEventListener('keydown', handleKeyDown, { capture: true });
-document.addEventListener('keyup', handleKeyUp, { capture: true });
-
-function handleKeyDown(event) {
-  // Prevent default browser behavior for our control keys regardless of keyboard state
-  if (isControlKey(event.code)) {
-    event.preventDefault();
-  }
-
-  // Show warning if robot is not connected and user presses control keys
-  if (isControlKey(event.code) && !isRobotEngaged) {
-    showConnectionWarning();
-    return;
-  }
-
-  // Only handle keys if keyboard control is enabled and we're focused on the page
-  if (!isKeyboardEnabled || pressedKeys.has(event.code)) return;
-
-  if (isControlKey(event.code)) {
-    pressedKeys.add(event.code);
-    sendKeyCommand(event.code, 'press');
-  }
-}
-
-function handleKeyUp(event) {
-  // Prevent default browser behavior for our control keys regardless of keyboard state
-  if (isControlKey(event.code)) {
-    event.preventDefault();
-  }
-  
-  // Only handle keys if keyboard control is enabled
-  if (!isKeyboardEnabled || !pressedKeys.has(event.code)) return;
-  
-  if (isControlKey(event.code)) {
-    pressedKeys.delete(event.code);
-    sendKeyCommand(event.code, 'release');
-  }
-}
-
-function isControlKey(code) {
-  // Check if this is one of our robot control keys
-  const controlKeys = [
-    // Left arm movement
-    'KeyW', 'KeyS', 'KeyA', 'KeyD', 'KeyQ', 'KeyE',
-    // Left arm wrist
-    'KeyZ', 'KeyX',  // wrist roll
-    'KeyR', 'KeyT',  // wrist flex
-    'KeyF',          // gripper
-    'Tab',           // toggle position control
-    // Right arm movement
-    'KeyI', 'KeyK', 'KeyJ', 'KeyL', 'KeyU', 'KeyO',
-    // Right arm wrist
-    'KeyN', 'KeyM',  // wrist roll
-    'KeyH', 'KeyY',  // wrist flex
-    'Semicolon',     // gripper
-    'Enter',         // toggle position control
-    // Global
-    'Escape'
-  ];
-  return controlKeys.includes(code);
-}
-
-function sendKeyCommand(keyCode, action) {
-  // Convert browser keyCode to our key mapping
-  const keyMap = {
-    // Left arm movement
-    'KeyW': 'w', 'KeyS': 's', 'KeyA': 'a', 'KeyD': 'd',
-    'KeyQ': 'q', 'KeyE': 'e',
-    // Left arm wrist
-    'KeyZ': 'z', 'KeyX': 'x',  // wrist roll
-    'KeyR': 'r', 'KeyT': 't',  // wrist flex
-    'KeyF': 'f',               // gripper
-    'Tab': 'tab',              // toggle position control
-    // Right arm movement
-    'KeyI': 'i', 'KeyK': 'k', 'KeyJ': 'j', 'KeyL': 'l',
-    'KeyU': 'u', 'KeyO': 'o',
-    // Right arm wrist
-    'KeyN': 'n', 'KeyM': 'm',  // wrist roll
-    'KeyH': 'h', 'KeyY': 'y',  // wrist flex
-    'Semicolon': ';',          // gripper
-    'Enter': 'enter',          // toggle position control
-    // Global
-    'Escape': 'esc'
-  };
-
-  const key = keyMap[keyCode];
-  if (!key) return;
-
-  fetch('/api/keypress', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ 
-      key: key, 
-      action: action 
-    })
-  })
-  .catch(error => {
-    console.error('Error sending key command:', error);
-  });
 }
 
 // Initialize

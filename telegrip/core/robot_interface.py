@@ -1,6 +1,5 @@
 """
 Robot interface module using Mink+MuJoCo for IK and visualization.
-Completely replaces PyBullet dependencies.
 """
 
 import numpy as np

@@ -1,6 +1,6 @@
 """
 MuJoCo-based kinematics using mink library for IK solving.
-Replaces PyBullet-based IK solver with mink's differential IK.
+Uses mink's differential IK solver.
 """
 
 import numpy as np

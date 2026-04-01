@@ -190,7 +190,7 @@ class ControlLoop:
             
             self.visualizer = MuJoCoVisualizer(
                 str(visualizer_scene_path),
-                use_gui=self.config.enable_pybullet_gui,
+                use_gui=self.config.enable_gui,
                 log_level=self.config.log_level
             )
             if not self.visualizer.setup():
@@ -557,28 +557,10 @@ class ControlLoop:
         """Handle individual commands."""
         action = command.get('action', '')
         logger.info(f"🔌 Processing control command: {action}")
-        
-        if action == 'enable_keyboard':
-            if self.web_keyboard_handler:
-                await self.web_keyboard_handler.start()
-                logger.info("🎮 Keyboard control ENABLED via API")
-        elif action == 'disable_keyboard':
-            if self.web_keyboard_handler:
-                await self.web_keyboard_handler.stop()
-                logger.info("🎮 Keyboard control DISABLED via API")
-        elif action == 'web_keypress':
-            # Handle individual keypress events from web interface
-            key = command.get('key')
-            event = command.get('event')  # 'press' or 'release'
 
-            if self.web_keyboard_handler and self.web_keyboard_handler.is_enabled:
-                logger.debug(f"🌐 Processing web keypress: {key}_{event}")
-                if event == 'press':
-                    self.web_keyboard_handler.on_key_press(key)
-                elif event == 'release':
-                    self.web_keyboard_handler.on_key_release(key)
-            else:
-                logger.warning("🎮 Web keyboard handler not enabled")
+        if action in {'enable_keyboard', 'disable_keyboard', 'web_keypress'}:
+            logger.warning(f"🎮 Keyboard control has been removed, ignoring command: {action}")
+            return
         elif action == 'robot_connect':
             logger.info("🔌 Processing robot_connect command")
             if self.robot_interface and self.robot_interface.is_connected:
@@ -1195,12 +1177,12 @@ class ControlLoop:
                     model_dt = None
 
             if model_dt is not None and model_dt > 0:
-                logger.info(
+                logger.debug(
                     f"⏱ runtime: control={ctrl_hz:.1f}Hz | mink_solve={mink_hz:.1f}Hz | "
                     f"mujoco_substep={mujoco_substep_hz:.1f}Hz (substeps={self.sim_substeps}, model_dt={model_dt:.4f}s)"
                 )
             else:
-                logger.info(
+                logger.debug(
                     f"⏱ runtime: control={ctrl_hz:.1f}Hz | mink_solve={mink_hz:.1f}Hz | "
                     f"mujoco_substep={mujoco_substep_hz:.1f}Hz (substeps={self.sim_substeps})"
                 )

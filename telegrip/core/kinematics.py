@@ -1,6 +1,6 @@
 """
 Compatibility module for kinematics functions.
-Provides helper functions that were previously in the PyBullet-based kinematics module.
+Provides helper functions kept for legacy compatibility.
 """
 
 import numpy as np

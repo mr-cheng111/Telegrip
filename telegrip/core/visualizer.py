@@ -1,6 +1,5 @@
 """
 MuJoCo visualization module using mink library.
-Replaces PyBullet visualization with MuJoCo's native viewer.
 """
 
 import numpy as np
@@ -393,7 +392,7 @@ class MuJoCoVisualizer:
         """
         Update coordinate frame visualization.
         
-        Note: MuJoCo doesn't have direct coordinate frame visualization like PyBullet.
+        Note: MuJoCo doesn't have a direct coordinate-frame primitive.
         This is handled automatically through the scene graph.
         """
         # In MuJoCo, coordinate frames are automatically visualized if sites are defined

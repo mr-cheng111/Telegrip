@@ -1,9 +1,9 @@
-# PyBullet移除完成 - 已全面切换到Mink+MuJoCo
+# Legacy Backend移除完成 - 已全面切换到Mink+MuJoCo
 
 ## 已完成的更改
 
 ### 1. 依赖更新
-- ✅ **移除**: `pybullet`
+- ✅ **移除**: `legacy_backend`
 - ✅ **添加**: `mujoco>=3.0.0` (核心依赖)
 - ✅ 更新了 `pyproject.toml` 和 `requirements.txt`
 
@@ -11,20 +11,20 @@
 
 #### IK和FK求解器
 - ✅ `robot_interface.py` - 完全基于Mink的新版本
-  - 使用 `MinkIKSolver` 替代 PyBullet IK
-  - 使用 `MinkForwardKinematics` 替代 PyBullet FK
+  - 使用 `MinkIKSolver` 替代 Legacy Backend IK
+  - 使用 `MinkForwardKinematics` 替代 Legacy Backend FK
   - 方法签名保持兼容
 
 #### 可视化
 - ✅ `visualizer.py` - 使用MuJoCo Viewer
-  - `MuJoCoVisualizer` 替代 `PyBulletVisualizer`  
+  - `MuJoCoVisualizer` 替代 `Legacy BackendVisualizer`  
   - 支持3D实时可视化
   - 自动在后台线程运行viewer
 
 #### 旧文件备份（已删除）
-- `robot_interface_pybullet.py.bak` 
-- `visualizer_pybullet.py.bak`
-- `kinematics_pybullet.py.bak`
+- `robot_interface_legacy_backend.py.bak` 
+- `visualizer_legacy_backend.py.bak`
+- `kinematics_legacy_backend.py.bak`
 
 ### 3. 配置文件
 
@@ -35,7 +35,7 @@ control:
     enabled: true
     mujoco_scene: URDF/SO100/scene.xml
     end_effector_site: Wrist_Pitch_Roll
-  pybullet:
+  legacy_backend:
     enabled: false
 ```
 
@@ -47,17 +47,17 @@ control:
     enabled: true
     mujoco_scene: mink/examples/arm620/scene.xml
     end_effector_site: tools_link
-  pybullet:
+  legacy_backend:
     enabled: false
 ```
 
-## Mink vs PyBullet 对比
+## Mink vs Legacy Backend 对比
 
-| 特性 | PyBullet (旧) | Mink+MuJoCo (新) |
+| 特性 | Legacy Backend (旧) | Mink+MuJoCo (新) |
 |------|--------------|------------------|
 | IK算法 | 数值IK | 微分IK (更平滑) |
 | 求解速度 | 中等 | 更快 |
-| 可视化 | PyBullet GUI | MuJoCo Viewer |
+| 可视化 | Legacy Backend GUI | MuJoCo Viewer |
 | 物理引擎 | Bullet | MuJoCo (更准确) |
 | 依赖大小 | 小 | 中等 |
 | 实时性能 | 好 | 更好 |
@@ -119,7 +119,7 @@ viz.disconnect()
 - **ARM620**: `mink/examples/arm620/scene.xml`
 - **SO100**: `URDF/SO100/scene.xml` (需要创建MuJoCo scene)
 
-## 回退到PyBullet（如需要）
+## 回退到Legacy Backend（如需要）
 
 备份文件已删除，但可从git历史恢复：
 ```bash

@@ -8,7 +8,6 @@ import argparse
 import logging
 import signal
 import sys
-import os
 
 from .config import TelegripConfig, load_config
 from .http_api import get_local_ip
@@ -23,10 +22,10 @@ def parse_arguments():
 
     # Control flags
     parser.add_argument("--no-robot", action="store_true", help="Disable robot connection (visualization only)")
-    parser.add_argument("--no-sim", action="store_true", help="Disable PyBullet simulation and inverse kinematics")
-    parser.add_argument("--no-viz", action="store_true", help="Disable PyBullet visualization (headless mode)")
+    parser.add_argument("--no-sim", action="store_true", help="Disable simulation and inverse kinematics")
+    parser.add_argument("--no-viz", action="store_true", help="Disable GUI visualization (headless mode)")
     parser.add_argument("--no-vr", action="store_true", help="Disable VR WebSocket server")
-    parser.add_argument("--no-keyboard", action="store_true", help="Disable keyboard input")
+    parser.add_argument("--no-keyboard", action="store_true", help="Deprecated (keyboard control has been removed)")
     parser.add_argument("--no-https", action="store_true", help="Disable HTTPS server")
     parser.add_argument("--autoconnect", action="store_true", help="Automatically connect to robot motors on startup")
     parser.add_argument("--log-level", default="info",
@@ -46,8 +45,6 @@ def parse_arguments():
 
     # Robot settings
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
-    parser.add_argument("--left-port", help="Left arm serial port (overrides config file)")
-    parser.add_argument("--right-port", help="Right arm serial port (overrides config file)")
 
     return parser.parse_args()
 
@@ -68,7 +65,6 @@ def create_config_from_args(args) -> TelegripConfig:
 
     keyboard_cfg = control_cfg.get("keyboard", {})
     vr_cfg = control_cfg.get("vr", {})
-    sim_cfg = control_cfg.get("pybullet", {})
     mink_cfg = control_cfg.get("mink", {})
 
     config.send_interval = float(robot_cfg.get("send_interval", config.send_interval))
@@ -85,15 +81,13 @@ def create_config_from_args(args) -> TelegripConfig:
     config.urdf_path = str(path_cfg.get("urdf_path", config.urdf_path))
     config.webapp_dir = str(path_cfg.get("webapp_dir", config.webapp_dir))
 
-    config.follower_ports = {
-        "left": robot_cfg.get("left_arm", {}).get("port", config.follower_ports["left"]),
-        "right": robot_cfg.get("right_arm", {}).get("port", config.follower_ports["right"]),
-    }
-
-    config.enable_keyboard = bool(keyboard_cfg.get("enabled", config.enable_keyboard))
+    config.enable_keyboard = False
     config.enable_vr = bool(vr_cfg.get("enabled", config.enable_vr))
-    config.enable_pybullet = bool(sim_cfg.get("enabled", config.enable_pybullet))
-    config.enable_pybullet_gui = bool(sim_cfg.get("enabled", config.enable_pybullet_gui))
+    config.enable_gui = bool(control_cfg.get("enable_gui", config.enable_gui))
+    config.enable_sim = bool(control_cfg.get("enable_sim", config.enable_sim))
+    # If simulation is disabled, GUI must also be disabled.
+    if not config.enable_sim:
+        config.enable_gui = False
     config.use_mink = bool(control_cfg.get("use_mink", config.use_mink))
     config.mink_mujoco_scene = str(mink_cfg.get("mujoco_scene", config.mink_mujoco_scene))
     config.end_effector_site = str(mink_cfg.get("end_effector_site", config.end_effector_site))
@@ -130,10 +124,10 @@ def create_config_from_args(args) -> TelegripConfig:
     if args.no_robot:
         config.enable_robot = False
     if args.no_sim:
-        config.enable_pybullet = False
-        config.enable_pybullet_gui = False
+        config.enable_sim = False
+        config.enable_gui = False
     elif args.no_viz:
-        config.enable_pybullet_gui = False
+        config.enable_gui = False
     if args.no_vr:
         config.enable_vr = False
     if args.no_keyboard:
@@ -157,12 +151,6 @@ def create_config_from_args(args) -> TelegripConfig:
     if args.key is not None:
         config.keyfile = args.key
 
-    if args.left_port or args.right_port:
-        config.follower_ports = {
-            "left": args.left_port if args.left_port else config_data["robot"]["left_arm"]["port"],
-            "right": args.right_port if args.right_port else config_data["robot"]["right_arm"]["port"]
-        }
-
     return config
 
 
@@ -170,10 +158,6 @@ async def main():
     """Main entry point."""
     args = parse_arguments()
     log_level = getattr(logging, args.log_level.upper())
-
-    if log_level > logging.INFO:
-        os.environ['PYBULLET_SUPPRESS_CONSOLE_OUTPUT'] = '1'
-        os.environ['PYBULLET_SUPPRESS_WARNINGS'] = '1'
 
     if log_level <= logging.INFO:
         logging.basicConfig(
@@ -197,15 +181,14 @@ async def main():
     if log_level <= logging.INFO:
         logger.info("Starting with configuration:")
         logger.info(f"  Robot: {'enabled' if config.enable_robot else 'disabled'}")
-        logger.info(f"  PyBullet: {'enabled' if config.enable_pybullet else 'disabled'}")
-        logger.info(f"  Headless mode: {'enabled' if not config.enable_pybullet_gui and config.enable_pybullet else 'disabled'}")
+        logger.info(f"  Simulation: {'enabled' if config.enable_sim else 'disabled'}")
+        logger.info(f"  Headless mode: {'enabled' if not config.enable_gui and config.enable_sim else 'disabled'}")
         logger.info(f"  VR: {'enabled' if config.enable_vr else 'disabled'}")
-        logger.info(f"  Keyboard: {'enabled' if config.enable_keyboard else 'disabled'}")
+        logger.info("  Keyboard: removed")
         logger.info(f"  Auto-connect: {'enabled' if config.autoconnect else 'disabled'}")
         logger.info(f"  Gnirehtet auto-start: {'enabled' if config.gnirehtet_enabled else 'disabled'}")
         logger.info(f"  HTTPS Port: {config.https_port}")
         logger.info(f"  WebSocket Port: {config.websocket_port}")
-        logger.info(f"  Robot Ports: {config.follower_ports}")
     else:
         host_display = get_local_ip() if config.host_ip == "0.0.0.0" else config.host_ip
         print(f"🤖 telegrip starting...")

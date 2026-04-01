@@ -16,8 +16,8 @@ https://github.com/user-attachments/assets/e21168b5-e9b4-4c83-ab4d-a15cb470d11b
 
 - **Unified Architecture**: Single entry point that coordinates all components
 - **Multiple Input Methods**: VR controllers (Quest/WebXR) and keyboard control
-- **Shared IK/FK Logic**: PyBullet-based inverse and forward kinematics for both arms
-- **Real-time Visualization**: 3D PyBullet visualization with coordinate frames and markers
+- **Shared IK/FK Logic**: Mink+MuJoCo-based inverse and forward kinematics for both arms
+- **Real-time Visualization**: 3D MuJoCo visualization with coordinate frames and markers
 - **Safety Features**: Joint limit clamping, graceful shutdown, and error handling
 - **Async/Non-blocking**: All components run concurrently without blocking
 
@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/e21168b5-e9b4-4c83-ab4d-a15cb470d11b
 
 ### Prerequisites
 
-1. **Robot Hardware**: One or two SO100 arm robot with USB-serial connections
+1. **Robot Hardware**: One or two SO100 arm robots
 2. **Python Environment**: Python 3.8+ with required packages
 3. **VR Setup** (optional): Meta Quest or other headset with WebXR support (no app installation needed!)
 4. **ROS2 (for real robot control)**: ROS2 Humble + `rclpy`, `sensor_msgs`, `std_msgs`
@@ -128,7 +128,7 @@ Open the UI in your browser on:
 https://192.168.7.233:8443
 Then go to the same address on your VR headset browser
 ```
-Click on or enter your address in a browser to show the UI. Visit the same address from your VR headset to enter the VR web-app. The first time you should enter robot arm port information under the settings menu (top right). Alternatively you can manually enter the details in the `config.yaml` file in the root of this repo.
+Click on or enter your address in a browser to show the UI. Visit the same address from your VR headset to enter the VR web-app.
 Once you see that the robot arms are found (green indicators) you can click "Connect Robot" and start controlling it by keyboard or with the VR headset.
 
 ### Command Line Options
@@ -138,8 +138,8 @@ telegrip [OPTIONS]
 
 Options:
   --no-robot        Disable robot connection (visualization only)
-  --no-sim          Disable PyBullet simulation and inverse kinematics
-  --no-viz          Disable PyBullet visualization (headless mode)
+  --no-sim          Disable simulation and inverse kinematics
+  --no-viz          Disable GUI visualization (headless mode)
   --no-vr           Disable VR WebSocket server
   --no-keyboard     Disable keyboard input
   --autoconnect     Automatically connect to robot motors on startup
@@ -149,8 +149,6 @@ Options:
   --host HOST       Host IP address (default: 0.0.0.0)
   --urdf PATH       Path to robot URDF file
   --config FILE     Path to config file (default: config.yaml)
-  --left-port PORT  Left arm serial port (default: /dev/ttySO100red)
-  --right-port PORT Right arm serial port (default: /dev/ttySO100leader)
 ```
 
 ### Development/Testing Modes
@@ -165,12 +163,12 @@ telegrip --no-robot
 telegrip --no-vr
 ```
 
-**No Simulation** (no PyBullet sim or IK):
+**No Simulation** (no sim or IK):
 ```bash
 telegrip --no-sim
 ```
 
-**Headless** (no PyBullet GUI):
+**Headless** (no GUI):
 ```bash
 telegrip --no-viz
 ```
@@ -230,7 +228,7 @@ graph TD
     D --> E
     E --> F[Control Loop]
     F --> G[Robot Interface]
-    F --> H[PyBullet Visualizer]
+    F --> H[MuJoCo Visualizer]
     G --> I[SO100 Robot Hardware]
     H --> J[3D Visualization]
 ```
@@ -286,8 +284,6 @@ class ControlGoal:
 ### Common Issues
 
 **Robot Connection Failed**:
-- Check USB-serial device permissions: `sudo chmod 666 /dev/ttySO100*`
-- Verify port names match actual devices
 - Try running with `--no-robot` for testing
 - Ensure you are using the system `telegrip` launcher (`#!/usr/bin/python3`), not a conflicting Conda one
 - Ensure ROS2 env is sourced before starting telegrip (`source /opt/ros/humble/setup.bash`)
@@ -298,8 +294,7 @@ class ControlGoal:
 - Try accessing web interface directly in browser first
 - If OpenSSL is missing, install it: `sudo apt-get install openssl` (Ubuntu) or `brew install openssl` (macOS)
 
-**PyBullet Visualization Issues**:
-- Install PyBullet: `pip install pybullet`
+**Visualization Issues**:
 - Try headless mode: `--no-viz`
 - Check URDF file exists at specified path
 
@@ -339,7 +334,7 @@ telegrip --log-level debug   # Show maximum detail for debugging
 
 ### Custom Visualization
 
-1. Extend `PyBulletVisualizer` class
+1. Extend `MuJoCoVisualizer` class
 2. Add new marker types or coordinate frames
 3. Update visualization calls in control loop
 

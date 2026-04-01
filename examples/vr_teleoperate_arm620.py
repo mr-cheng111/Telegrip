@@ -9,8 +9,8 @@ Usage:
     python vr_teleoperate_arm620.py [options]
 
     --no-robot          Disable robot connection (visualization only)
-    --no-sim            Disable PyBullet simulation
-    --no-viz            Disable PyBullet visualization (headless mode)
+    --no-sim            Disable simulation
+    --no-viz            Disable GUI visualization (headless mode)
     --no-vr             Disable VR WebSocket server
     --no-keyboard       Disable keyboard input
     --autoconnect       Automatically connect to robot motors on startup

@@ -6,7 +6,7 @@ Loads configuration from config.yaml file with fallback to default values.
 import os
 import yaml
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import List
 import numpy as np
 from pathlib import Path
 import logging
@@ -34,12 +34,10 @@ DEFAULT_CONFIG = {
     "robot": {
         "left_arm": {
             "name": "Left Arm",
-            "port": "/dev/ttyACM0",
             "enabled": True
         },
         "right_arm": {
             "name": "Right Arm",
-            "port": "/dev/ttyACM1",
             "enabled": True
         },
         "vr_to_robot_scale": 1.0,
@@ -48,6 +46,8 @@ DEFAULT_CONFIG = {
     },
     "control": {
         "use_mink": True,
+        "enable_sim": True,
+        "enable_gui": True,
         "mink": {
             "enabled": True,
             "mujoco_scene": "mink/examples/arm620/scene.xml",
@@ -63,7 +63,7 @@ DEFAULT_CONFIG = {
             "orientation_error_threshold": 1e-3,
         },
         "keyboard": {
-            "enabled": True,
+            "enabled": False,
             "pos_step": 0.01,
             "angle_step": 5.0,
             "gripper_step": 10.0
@@ -71,9 +71,6 @@ DEFAULT_CONFIG = {
         "vr": {
             "enabled": True,
             "orientation_reference_quat_xyzw": {}
-        },
-        "pybullet": {
-            "enabled": True
         }
     },
     "paths": {
@@ -214,19 +211,13 @@ URDF_TO_INTERNAL_NAME_MAP = {
     "6": "gripper",
 }
 
-# --- PyBullet Configuration ---
+# --- End Effector Configuration ---
 END_EFFECTOR_LINK_NAME = "Fixed_Jaw_tip"
 
 # --- Keyboard Control ---
 POS_STEP = 0.01  # meters
 ANGLE_STEP = 5.0 # degrees
 GRIPPER_STEP = 10.0 # degrees
-
-# --- Device Ports ---
-DEFAULT_FOLLOWER_PORTS = {
-    "left": _config_data["robot"]["left_arm"]["port"],
-    "right": _config_data["robot"]["right_arm"]["port"]
-}
 
 @dataclass
 class TelegripConfig:
@@ -252,15 +243,12 @@ class TelegripConfig:
     send_interval: float = SEND_INTERVAL
     require_state_feedback: bool = _config_data["robot"].get("require_state_feedback", False)
     
-    # Device ports
-    follower_ports: Dict[str, str] = None
-    
     # Control flags
-    enable_pybullet: bool = True
-    enable_pybullet_gui: bool = True
+    enable_sim: bool = True
+    enable_gui: bool = True
     enable_robot: bool = True
     enable_vr: bool = True
-    enable_keyboard: bool = True
+    enable_keyboard: bool = False
     autoconnect: bool = False
     log_level: str = "warning"
 
@@ -302,19 +290,6 @@ class TelegripConfig:
         if self.gnirehtet_args is None:
             cfg_args = _config_data.get("gnirehtet", {}).get("args", [])
             self.gnirehtet_args = [str(arg) for arg in cfg_args] if isinstance(cfg_args, list) else []
-
-        # Initialize follower_ports if not set
-        if self.follower_ports is None:
-            self.follower_ports = {
-                "left": _config_data["robot"]["left_arm"]["port"],
-                "right": _config_data["robot"]["right_arm"]["port"]
-            }
-        
-        # Ensure ports are not None
-        if self.follower_ports["left"] is None:
-            self.follower_ports["left"] = "/dev/ttyACM0"
-        if self.follower_ports["right"] is None:
-            self.follower_ports["right"] = "/dev/ttyACM1"
     
     @property
     def ssl_files_exist(self) -> bool:

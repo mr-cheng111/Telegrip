@@ -13,7 +13,6 @@ from .config import TelegripConfig
 from .control_loop import ControlLoop
 from .http_api import HTTPSServer
 from .inputs.vr_ws_server import VRWebSocketServer
-from .inputs.web_keyboard import WebKeyboardHandler
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +28,12 @@ class TelegripSystem:
 
         self.https_server = HTTPSServer(config)
         self.vr_server = VRWebSocketServer(self.command_queue, config)
-        self.web_keyboard_handler = WebKeyboardHandler(self.command_queue, config)
+        self.web_keyboard_handler = None
         self.control_loop = ControlLoop(self.command_queue, config, self.control_commands_queue)
 
         self.https_server.set_system_ref(self)
 
-        self.control_loop.web_keyboard_handler = self.web_keyboard_handler
-        self.web_keyboard_handler.disconnect_callback = lambda: self.add_control_command("robot_disconnect")
+        self.control_loop.web_keyboard_handler = None
 
         self.tasks = []
         self.is_running = False
@@ -168,7 +166,6 @@ class TelegripSystem:
                     logger.warning("Some tasks did not complete within timeout")
 
             await self.control_loop.stop()
-            await self.web_keyboard_handler.stop()
             await self.vr_server.stop()
 
             await asyncio.sleep(1)
@@ -181,16 +178,14 @@ class TelegripSystem:
             self.control_commands_queue = queue.Queue(maxsize=10)
 
             self.vr_server = VRWebSocketServer(self.command_queue, self.config)
-            self.web_keyboard_handler = WebKeyboardHandler(self.command_queue, self.config)
+            self.web_keyboard_handler = None
             self.control_loop = ControlLoop(self.command_queue, self.config, self.control_commands_queue)
 
-            self.control_loop.web_keyboard_handler = self.web_keyboard_handler
-            self.web_keyboard_handler.disconnect_callback = lambda: self.add_control_command("robot_disconnect")
+            self.control_loop.web_keyboard_handler = None
 
             self.tasks = []
 
             await self.vr_server.start()
-            await self.web_keyboard_handler.start()
 
             control_task = asyncio.create_task(self.control_loop.start())
             self.tasks.append(control_task)
@@ -218,7 +213,6 @@ class TelegripSystem:
 
             await self.https_server.start()
             await self.vr_server.start()
-            await self.web_keyboard_handler.start()
 
             control_task = asyncio.create_task(self.control_loop.start())
             self.tasks.append(control_task)
@@ -297,13 +291,6 @@ class TelegripSystem:
             logger.warning("Control loop stop timed out")
         except Exception as e:
             logger.warning(f"Error stopping control loop: {e}")
-
-        try:
-            await asyncio.wait_for(self.web_keyboard_handler.stop(), timeout=1.0)
-        except asyncio.TimeoutError:
-            logger.warning("Web keyboard handler stop timed out")
-        except Exception as e:
-            logger.warning(f"Error stopping web keyboard handler: {e}")
 
         try:
             await asyncio.wait_for(self.https_server.stop(), timeout=2.0)

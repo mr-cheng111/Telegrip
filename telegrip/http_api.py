@@ -82,10 +82,6 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
 
             control_status = system.control_loop.status if system.control_loop else {}
 
-            keyboard_enabled = False
-            if system.web_keyboard_handler and hasattr(system.web_keyboard_handler, 'is_enabled'):
-                keyboard_enabled = system.web_keyboard_handler.is_enabled
-
             robot_engaged = False
             if system.control_loop and system.control_loop.robot_interface:
                 robot_engaged = system.control_loop.robot_interface.is_engaged
@@ -96,7 +92,7 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
 
             status = {
                 **control_status,
-                "keyboardEnabled": keyboard_enabled,
+                "keyboardEnabled": False,
                 "robotEngaged": robot_engaged,
                 "vrConnected": vr_connected
             }
@@ -107,29 +103,13 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def handle_keyboard_request(self):
-        try:
-            data = self._read_json_body()
-            action = data.get('action')
-
-            if action in ['enable', 'disable']:
-                system = self._get_system()
-                if not system:
-                    self.send_error(500, "System not available")
-                    return
-                command_name = f"{action}_keyboard"
-                logger.info(f"🎮 Adding command to queue: {command_name}")
-                system.add_control_command(command_name)
-                self._send_json_response({"success": True, "action": action})
-            else:
-                self.send_error(400, f"Invalid action: {action}")
-
-        except ValueError as e:
-            self.send_error(400, str(e))
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
-        except Exception as e:
-            logger.error(f"Error handling keyboard request: {e}")
-            self.send_error(500, str(e))
+        self._send_json_response(
+            {
+                "success": False,
+                "error": "Keyboard control has been removed"
+            },
+            status=410,
+        )
 
     def handle_robot_request(self):
         try:
@@ -159,36 +139,13 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def handle_keypress_request(self):
-        try:
-            data = self._read_json_body()
-
-            key = data.get('key')
-            action = data.get('action')
-
-            if key and action in ['press', 'release']:
-                system = self._get_system()
-                if not system:
-                    logger.error("🎮 Server api_handler not available")
-                    self.send_error(500, "System not available")
-                    return
-                command = {
-                    "action": "web_keypress",
-                    "key": key,
-                    "event": action
-                }
-                logger.info(f"🎮 Adding keypress command to queue: {key}_{action}")
-                system.add_keypress_command(command)
-                self._send_json_response({"success": True, "key": key, "action": action})
-            else:
-                self.send_error(400, f"Invalid key or action: {key}, {action}")
-
-        except ValueError as e:
-            self.send_error(400, str(e))
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
-        except Exception as e:
-            logger.error(f"Error handling keypress request: {e}")
-            self.send_error(500, str(e))
+        self._send_json_response(
+            {
+                "success": False,
+                "error": "Keyboard control has been removed"
+            },
+            status=410,
+        )
 
     def handle_config_get_request(self):
         try:
