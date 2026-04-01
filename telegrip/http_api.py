@@ -82,9 +82,7 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
 
             control_status = system.control_loop.status if system.control_loop else {}
 
-            robot_engaged = False
-            if system.control_loop and system.control_loop.robot_interface:
-                robot_engaged = system.control_loop.robot_interface.is_engaged
+            robot_engaged = bool(getattr(system, "config", None) and getattr(system.config, "enable_robot", False))
 
             vr_connected = False
             if system.vr_server and system.vr_server.is_running:
@@ -116,19 +114,13 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             data = self._read_json_body()
             action = data.get('action')
             logger.info(f"🔌 Received robot action: {action}")
-
-            if action in ['connect', 'disconnect']:
-                system = self._get_system()
-                if not system:
-                    logger.error("🔌 Server api_handler not available")
-                    self.send_error(500, "System not available")
-                    return
-                command_name = f"robot_{action}"
-                logger.info(f"🔌 Adding command to queue: {command_name}")
-                system.add_control_command(command_name)
-                self._send_json_response({"success": True, "action": action})
-            else:
-                self.send_error(400, f"Invalid action: {action}")
+            self._send_json_response(
+                {
+                    "success": False,
+                    "error": "Manual robot connect/disconnect API has been removed; backend reconnects automatically."
+                },
+                status=410,
+            )
 
         except ValueError as e:
             self.send_error(400, str(e))

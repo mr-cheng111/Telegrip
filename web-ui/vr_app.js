@@ -1125,41 +1125,7 @@ function addControllerTrackingButton() {
                     startButton.disabled = true;
 
                     try {
-                        debugLog('🔌 Checking robot...');
-                        // Check if robot is already connected
-                        const statusResponse = await fetch('/api/status');
-                        const status = await statusResponse.json();
-
-                        // Only try to connect robot if not in no-robot mode
-                        if (status.robotEngaged === false && status.left_arm_connected !== undefined) {
-                            console.log('Robot not connected. Connecting arms first...');
-                            startButton.textContent = 'Connecting Arms...';
-                            debugLog('🤖 Connecting robot...');
-
-                            // Connect the robot arms
-                            const connectResponse = await fetch('/api/robot', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json'
-                                },
-                                body: JSON.stringify({ action: 'connect' })
-                            });
-                            const connectResult = await connectResponse.json();
-
-                            if (!connectResult.success) {
-                                console.warn('Failed to connect robot arms:', connectResult.error);
-                                // Don't fail if in no-robot mode
-                                if (!connectResult.error.includes('interface')) {
-                                    throw new Error(connectResult.error || 'Failed to connect robot arms');
-                                }
-                            } else {
-                                console.log('Robot arms connected successfully.');
-                                await new Promise(resolve => setTimeout(resolve, 500));
-                            }
-                        } else {
-                            console.log('Robot already connected or in no-robot mode.');
-                            debugLog('✅ Robot OK');
-                        }
+                        debugLog('🔌 Robot backend uses automatic reconnect');
 
                         // Start XR mode: prefer passthrough AR, then fallback to VR.
                         console.log('Requesting XR session...');

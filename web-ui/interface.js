@@ -1,5 +1,5 @@
 // Global state
-let isRobotEngaged = false;
+let isRobotEngaged = true;
 let currentConfig = {};
 
 // Settings modal functions
@@ -174,7 +174,7 @@ function updateStatus() {
 
       // Update robot engagement status
       if (data.robotEngaged !== undefined) {
-        isRobotEngaged = data.robotEngaged;
+        isRobotEngaged = true;
         updateEngagementUI();
       }
     })
@@ -189,47 +189,35 @@ function updateEngagementUI() {
   const engagementStatusText = document.getElementById('engagementStatusText');
   const connectionHint = document.getElementById('connectionHint');
   const connectionWarning = document.getElementById('connectionWarning');
+  if (!engagementStatusText) return;
+
+  if (engageBtn) {
+    engageBtn.disabled = true;
+    engageBtn.style.display = 'none';
+  }
+  if (engageBtnText) {
+    engageBtnText.textContent = 'Manual Control Removed';
+  }
 
   if (isRobotEngaged) {
-    engageBtn.classList.add('disconnect');
-    engageBtn.classList.remove('needs-attention');
-    engageBtnText.textContent = '🔌 Disconnect Robot';
-    engagementStatusText.textContent = 'Motors Engaged';
+    if (engageBtn) {
+      engageBtn.classList.add('disconnect');
+      engageBtn.classList.remove('needs-attention');
+    }
+    engagementStatusText.textContent = 'Robot Control: Always On (ROS2 Managed)';
     engagementStatusText.style.color = '#FFFFFF';
     if (connectionHint) connectionHint.style.display = 'none';
     if (connectionWarning) connectionWarning.classList.remove('show');
   } else {
-    engageBtn.classList.remove('disconnect');
-    engageBtnText.textContent = '🔌 Connect Robot';
-    engagementStatusText.textContent = 'Motors Disengaged';
+    if (engageBtn) engageBtn.classList.remove('disconnect');
+    engagementStatusText.textContent = 'Robot Control: Auto-Reconnecting';
     engagementStatusText.style.color = '#FFFFFF';
-    if (connectionHint) connectionHint.style.display = 'block';
+    if (connectionHint) connectionHint.style.display = 'none';
   }
 }
 
 function toggleRobotEngagement() {
-  const action = isRobotEngaged ? 'disconnect' : 'connect';
-  
-  fetch('/api/robot', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ action: action })
-  })
-  .then(response => response.json())
-  .then(data => {
-    if (data.success) {
-      isRobotEngaged = !isRobotEngaged;
-      updateEngagementUI();
-    } else {
-      alert('Failed to ' + action + ' robot: ' + (data.error || 'Unknown error'));
-    }
-  })
-  .catch(error => {
-    console.error('Error toggling robot engagement:', error);
-    alert('Error communicating with server');
-  });
+  console.warn('Manual robot connect/disconnect has been removed.');
 }
 
 // Check if running in VR/AR mode
@@ -447,30 +435,6 @@ function createFallbackVrButton() {
       startButton.textContent = 'Connecting...';
       startButton.disabled = true;
       try {
-        // Check if robot is already connected
-        const statusResponse = await fetch('/api/status');
-        const status = await statusResponse.json();
-        
-        // Only try to connect robot if not in no-robot mode
-        if (status.robotEngaged === false && status.left_arm_connected !== undefined) {
-          startButton.textContent = 'Connecting Arms...';
-          const connectResponse = await fetch('/api/robot', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'connect' })
-          });
-          const connectResult = await connectResponse.json();
-          if (!connectResult.success) {
-            console.warn('Failed to connect robot arms:', connectResult.error);
-            // Don't fail if in no-robot mode
-            if (!connectResult.error.includes('interface')) {
-              throw new Error(connectResult.error || 'Failed to connect robot arms');
-            }
-          } else {
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-        }
-        
         startButton.textContent = 'Starting VR...';
         
         // Check if enterVR method exists

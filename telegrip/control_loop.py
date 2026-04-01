@@ -221,19 +221,17 @@ class ControlLoop:
             logger.info(f"Robot interface connect() returned: {connect_result}, enable_robot={self.config.enable_robot}")
             if not connect_result:
                 error_msg = "Robot interface failed to connect"
-                logger.error(error_msg)
+                logger.warning(error_msg)
                 setup_errors.append(error_msg)
-                if self.config.enable_robot:
-                    success = False
-                    logger.error(f"Setting success=False because enable_robot={self.config.enable_robot}")
-                else:
-                    logger.info(f"Not failing setup because enable_robot={self.config.enable_robot}")
+                logger.warning(
+                    "Continuing startup in disconnected mode; "
+                    "backend will auto-reconnect when hardware process is available."
+                )
         except Exception as e:
             error_msg = f"Robot interface setup failed with exception: {e}"
             logger.error(error_msg)
             setup_errors.append(error_msg)
-            if self.config.enable_robot:
-                success = False
+            success = False
 
         # Capture startup joint_state once so MuJoCo can start from real arm pose.
         try:
@@ -439,11 +437,8 @@ class ControlLoop:
         """Stop the control loop."""
         self.is_running = False
 
-        # Cleanup - disengage robot first (returns to home and disables torque)
+        # Cleanup - backend disconnect only (motor enable is managed externally).
         if self.robot_interface:
-            if self.robot_interface.is_engaged:
-                logger.info("🛑 Disengaging robot before shutdown...")
-                self.robot_interface.disengage()
             self.robot_interface.disconnect()
 
         if self.visualizer:
@@ -689,40 +684,9 @@ class ControlLoop:
             logger.warning(f"🎮 Keyboard control has been removed, ignoring command: {action}")
             return
         elif action == 'robot_connect':
-            logger.info("🔌 Processing robot_connect command")
-            if self.robot_interface and self.robot_interface.is_connected:
-                logger.info(f"🔌 Robot interface available and connected: {self.robot_interface.is_connected}")
-                success = self.robot_interface.engage()
-                if success:
-                    logger.info("🔌 Robot motors ENGAGED via API")
-                    # Unified control path keeps targets synchronized automatically.
-                else:
-                    logger.error("❌ Failed to engage robot motors")
-            else:
-                logger.warning(f"Cannot engage robot: interface={self.robot_interface is not None}, connected={self.robot_interface.is_connected if self.robot_interface else False}")
+            logger.info("🔌 robot_connect command ignored (manual engage API removed)")
         elif action == 'robot_disconnect':
-            logger.info("🔌 Processing robot_disconnect command")
-            if self.robot_interface:
-                logger.info(f"🔌 Robot interface available")
-                success = self.robot_interface.disengage()
-                if success:
-                    logger.info("🔌 Robot motors DISENGAGED via API")
-                    # Reset arm states to IDLE when robot is disengaged
-                    self.left_arm.reset()
-                    self.right_arm.reset()
-                    logger.info("🔓 Both arms: Position control DEACTIVATED after robot disconnect")
-                    
-                    # Hide visualization markers
-                    if self.visualizer:
-                        for arm in ["left", "right"]:
-                            self.visualizer.hide_marker(f"{arm}_goal")
-                            self.visualizer.hide_frame(f"{arm}_goal_frame")
-                            self.visualizer.hide_marker(f"{arm}_target")
-                            self.visualizer.hide_frame(f"{arm}_target_frame")
-                else:
-                    logger.error("❌ Failed to disengage robot motors")
-            else:
-                logger.warning("Cannot disengage robot: no robot interface")
+            logger.info("🔌 robot_disconnect command ignored (manual disengage API removed)")
         else:
             logger.warning(f"Unknown command: {action}")
 
@@ -908,41 +872,28 @@ class ControlLoop:
         for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
             target_name = f"{arm_name}_target"
             goal_name = f"{arm_name}_goal"
+            actual_pos = self._get_current_ee_position(arm_name)
+            actual_quat = self._get_current_ee_orientation(arm_name)
 
-            # 1) Resolve IK target source (input stream marker or viewer drag marker).
-            drag_target = self.visualizer.get_mocap_position(target_name)
-            drag_quat = self.visualizer.get_mocap_quaternion(target_name)
-            drag_active = False
-            if arm_state.mode == ControlMode.IDLE and drag_target is not None:
-                prev_p = arm_state.last_mocap_target_position
-                prev_q = arm_state.last_mocap_target_quaternion
-                pos_changed = prev_p is None or np.linalg.norm(drag_target - prev_p) > 1e-5
-                quat_changed = False
-                if drag_quat is not None:
-                    q = np.asarray(drag_quat, dtype=float)
-                    n = np.linalg.norm(q)
-                    if n > 1e-9:
-                        q = q / n
-                        if prev_q is None:
-                            quat_changed = True
-                        else:
-                            # Account for quaternion sign ambiguity (q and -q are same rotation)
-                            quat_changed = min(np.linalg.norm(q - prev_q), np.linalg.norm(q + prev_q)) > 1e-4
-                        drag_quat = q
-                drag_active = pos_changed or quat_changed
+            # IDLE policy: target marker must remain exactly on tools_link every frame.
+            # This prevents idle drift and avoids grip press/release transients.
+            if arm_state.mode != ControlMode.POSITION_CONTROL:
+                self.visualizer.update_marker_position(target_name, actual_pos, actual_quat)
+                arm_state.last_mocap_target_position = actual_pos.copy()
+                arm_state.last_mocap_target_quaternion = actual_quat.copy()
+                self.visualizer.hide_marker(goal_name)
+                self.visualizer.hide_frame(f"{target_name}_frame")
+                self.visualizer.hide_frame(f"{goal_name}_frame")
+                self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
+                continue
 
-            should_solve = (
-                (arm_state.mode == ControlMode.POSITION_CONTROL and arm_state.target_position is not None)
-                or drag_active
-            )
-
+            should_solve = arm_state.target_position is not None
             if should_solve:
-                ik_target = arm_state.target_position if arm_state.target_position is not None else drag_target
+                ik_target = arm_state.target_position
                 ik_target_quat = arm_state.target_orientation_quat
 
                 # Position-control mode commands the marker from input goals.
-                if arm_state.mode == ControlMode.POSITION_CONTROL:
-                    self.visualizer.update_marker_position(target_name, ik_target, arm_state.target_orientation_quat)
+                self.visualizer.update_marker_position(target_name, ik_target, arm_state.target_orientation_quat)
 
                 mocap_pos = self.visualizer.get_mocap_position(target_name)
                 if mocap_pos is not None:
@@ -958,8 +909,7 @@ class ControlLoop:
                         arm_state.last_mocap_target_quaternion = q.copy()
 
                 # 2) Legacy smoothing / target shaping before IK.
-                current_ee = self._get_current_ee_position(arm_name)
-                ik_target = current_ee + IK_TARGET_SMOOTHING * (ik_target - current_ee)
+                ik_target = actual_pos + IK_TARGET_SMOOTHING * (ik_target - actual_pos)
 
                 # 3) 收集双臂IK请求，统一交给共享Mink求解器。
                 ik_requests[arm_name] = {
@@ -982,8 +932,6 @@ class ControlLoop:
                 self.visualizer.hide_frame(f"{goal_name}_frame")
 
             # Always show current tools_link pose as an "actual" marker.
-            actual_pos = self._get_current_ee_position(arm_name)
-            actual_quat = self._get_current_ee_orientation(arm_name)
             self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
 
         # 4.5) 双臂一次联合IK求解（与 arm_arm620_dual 示例一致）。
@@ -1050,8 +998,8 @@ class ControlLoop:
             if r_sim is not None:
                 self.robot_interface.set_simulated_arm_angles("right", r_sim)
 
-        # 7) Publish hardware commands (if enabled/engaged).
-        if self.robot_interface.is_connected and self.robot_interface.is_engaged:
+        # 7) Publish hardware commands (auto-reconnect is handled in send_command()).
+        if self.config.enable_robot:
             self.robot_interface.send_command()
     
     def _update_robot(self):
@@ -1061,7 +1009,7 @@ class ControlLoop:
 
         if not self.config.use_mink:
             # Keep gripper commands and passthrough robot publishing only.
-            if self.robot_interface.is_connected and self.robot_interface.is_engaged:
+            if self.config.enable_robot:
                 self.robot_interface.send_command()
             return
 
@@ -1072,30 +1020,25 @@ class ControlLoop:
 
         for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
             target_name = f"{arm_name}_target"
-
-            drag_target = self.visualizer.get_mocap_position(target_name) if self.visualizer else None
-
-            drag_active = False
-            if arm_state.mode == ControlMode.IDLE and drag_target is not None:
-                prev = arm_state.last_mocap_target_position
-                drag_active = prev is None or np.linalg.norm(drag_target - prev) > 1e-5
-
-            should_solve = (
-                (arm_state.mode == ControlMode.POSITION_CONTROL and arm_state.target_position is not None)
-                or drag_active
-            )
-
-            if not should_solve:
+            if arm_state.mode != ControlMode.POSITION_CONTROL or arm_state.target_position is None:
+                if self.visualizer:
+                    current_pos = self._get_current_ee_position(arm_name)
+                    current_quat = self._get_current_ee_orientation(arm_name)
+                    self.visualizer.update_marker_position(target_name, current_pos, current_quat)
+                    self.visualizer.hide_marker(f"{arm_name}_goal")
+                    self.visualizer.hide_frame(f"{arm_name}_target_frame")
+                    self.visualizer.hide_frame(f"{arm_name}_goal_frame")
+                    arm_state.last_mocap_target_position = current_pos.copy()
+                    arm_state.last_mocap_target_quaternion = current_quat.copy()
                 continue
 
-            ik_target = arm_state.target_position if arm_state.target_position is not None else drag_target
+            ik_target = arm_state.target_position
             ik_target_quat = arm_state.target_orientation_quat
 
             if self.visualizer:
-                if arm_state.mode == ControlMode.POSITION_CONTROL:
-                    self.visualizer.update_marker_position(
-                        target_name, ik_target, arm_state.target_orientation_quat
-                    )
+                self.visualizer.update_marker_position(
+                    target_name, ik_target, arm_state.target_orientation_quat
+                )
                 mocap_pos = self.visualizer.get_mocap_position(target_name)
                 if mocap_pos is not None:
                     ik_target = mocap_pos
@@ -1155,8 +1098,8 @@ class ControlLoop:
                     wrist_override=right_req["wrist_override"],
                 )
 
-        # Send commands to robot hardware (only if connected and engaged)
-        if self.robot_interface.is_connected and self.robot_interface.is_engaged:
+        # Send commands to robot hardware (auto-reconnect handled inside send_command()).
+        if self.config.enable_robot:
             self.robot_interface.send_command()
 
     def _update_visualization(self):
@@ -1193,8 +1136,12 @@ class ControlLoop:
                 self.visualizer.update_marker_position("left_goal", self.left_arm.goal_position)
                 self.visualizer.update_coordinate_frame("left_goal_frame", self.left_arm.goal_position)
         else:
-            # In idle mode, keep target marker draggable by user (do not overwrite it).
-            # Hide only goal marker when not in active dragging.
+            # In idle mode, force target marker to overlap current tools_link.
+            left_actual_pos = self._get_current_ee_position("left")
+            left_actual_quat = self._get_current_ee_orientation("left")
+            self.visualizer.update_marker_position("left_target", left_actual_pos, left_actual_quat)
+            self.left_arm.last_mocap_target_position = left_actual_pos.copy()
+            self.left_arm.last_mocap_target_quaternion = left_actual_quat.copy()
             self.visualizer.hide_marker("left_goal")
             self.visualizer.hide_frame("left_target_frame")
             self.visualizer.hide_frame("left_goal_frame")
@@ -1213,8 +1160,12 @@ class ControlLoop:
                 self.visualizer.update_marker_position("right_goal", self.right_arm.goal_position)
                 self.visualizer.update_coordinate_frame("right_goal_frame", self.right_arm.goal_position)
         else:
-            # In idle mode, keep target marker draggable by user (do not overwrite it).
-            # Hide only goal marker when not in active dragging.
+            # In idle mode, force target marker to overlap current tools_link.
+            right_actual_pos = self._get_current_ee_position("right")
+            right_actual_quat = self._get_current_ee_orientation("right")
+            self.visualizer.update_marker_position("right_target", right_actual_pos, right_actual_quat)
+            self.right_arm.last_mocap_target_position = right_actual_pos.copy()
+            self.right_arm.last_mocap_target_quaternion = right_actual_quat.copy()
             self.visualizer.hide_marker("right_goal")
             self.visualizer.hide_frame("right_target_frame")
             self.visualizer.hide_frame("right_goal_frame")

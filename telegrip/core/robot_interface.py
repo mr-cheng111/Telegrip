@@ -6,6 +6,9 @@ import numpy as np
 import time
 import logging
 import mujoco
+import ctypes
+import importlib
+import sys
 from typing import Optional, Dict, TYPE_CHECKING, Tuple
 from pathlib import Path
 
@@ -27,6 +30,140 @@ from ..config import (
 from .mink_kinematics import MinkIKSolver, MinkDualIKSolver, MinkForwardKinematics
 
 logger = logging.getLogger(__name__)
+
+
+class ArmControllerStreamingClient:
+    """arm_controller_py CommandStreaming backend (position mode)."""
+
+    def __init__(self, config: TelegripConfig):
+        self.config = config
+        workspace_raw = str(getattr(config, "arm_controller_workspace", "") or "").strip()
+        self.workspace = Path(workspace_raw).expanduser() if workspace_raw else None
+        self.module_dir = str(getattr(config, "arm_controller_module_dir", "") or "").strip()
+        self.mappings = {
+            "left": str(getattr(config, "arm_controller_left_mapping", "left_arm") or "left_arm"),
+            "right": str(getattr(config, "arm_controller_right_mapping", "right_arm") or "right_arm"),
+        }
+        self.interpolation_alpha = float(
+            np.clip(float(getattr(config, "arm_command_interpolation_alpha", 1.0)), 0.0, 1.0)
+        )
+        self.max_step_rad = np.deg2rad(
+            max(0.0, float(getattr(config, "arm_command_max_step_deg", 0.0)))
+        )
+
+        self._ac = None
+        self._controller = None
+        self._initialized = False
+        self._last_positions_rad = {"left": None, "right": None}
+        self._zero_vel = [0.0] * NUM_JOINTS
+        self._zero_eff = [0.0] * NUM_JOINTS
+
+    def _candidate_module_dirs(self) -> list[Path]:
+        candidates = []
+        if self.module_dir:
+            candidates.append(Path(self.module_dir).expanduser())
+        if self.workspace:
+            candidates.extend([
+                self.workspace / "install" / "arm_controller" / "lib" / "arm_controller",
+                self.workspace / "src" / "install" / "arm_controller" / "lib" / "arm_controller",
+                self.workspace / "build" / "arm_controller",
+            ])
+        return candidates
+
+    def _candidate_deps(self) -> list[Path]:
+        if not self.workspace:
+            return []
+        return [
+            self.workspace / "install" / "hardware_driver" / "lib" / "libhardware_driver_canfd.so",
+            self.workspace / "build" / "hardware_driver" / "lib" / "libhardware_driver_canfd.so",
+            self.workspace / "install" / "trajectory_planning_v3" / "lib" / "libtrajectory_planning_v3.so",
+            self.workspace / "build" / "trajectory_planning_v3" / "libtrajectory_planning_v3.so",
+        ]
+
+    def _prepare_imports(self):
+        loaded = []
+        for dep in self._candidate_deps():
+            if not dep.exists():
+                continue
+            try:
+                ctypes.CDLL(str(dep), mode=ctypes.RTLD_GLOBAL)
+                loaded.append(str(dep))
+            except Exception as e:
+                logger.debug(f"Failed to preload dependency {dep}: {e}")
+        if loaded:
+            logger.debug(f"Preloaded arm-controller dependencies: {loaded}")
+
+        for mod_dir in self._candidate_module_dirs():
+            if mod_dir.is_dir():
+                mod_dir_str = str(mod_dir)
+                if mod_dir_str not in sys.path:
+                    sys.path.insert(0, mod_dir_str)
+
+    def connect(self) -> bool:
+        try:
+            self._prepare_imports()
+            self._ac = importlib.import_module("arm_controller_py")
+            if not self._ac.IPCLifecycle.initialize():
+                last_error_fn = getattr(self._ac.IPCLifecycle, "get_last_error", None)
+                err_msg = last_error_fn() if callable(last_error_fn) else "unknown error"
+                raise RuntimeError(f"IPCLifecycle.initialize() failed: {err_msg}")
+            self._controller = self._ac.CommandStreamingIPCInterface()
+            self._initialized = True
+            logger.info("CommandStreaming backend initialized")
+            return True
+        except Exception as e:
+            logger.error(f"CommandStreaming backend connect failed: {e}")
+            self._initialized = False
+            self._ac = None
+            self._controller = None
+            return False
+
+    def disconnect(self):
+        if not self._initialized:
+            return
+        try:
+            if self._ac is not None:
+                self._ac.IPCLifecycle.shutdown()
+        except Exception as e:
+            logger.debug(f"CommandStreaming shutdown failed: {e}")
+        finally:
+            self._initialized = False
+            self._ac = None
+            self._controller = None
+            self._last_positions_rad = {"left": None, "right": None}
+
+    def _smooth_positions(self, arm: str, target_rad: np.ndarray) -> np.ndarray:
+        prev = self._last_positions_rad.get(arm)
+        cmd = target_rad.copy()
+        if prev is not None:
+            if self.interpolation_alpha < 1.0:
+                cmd = prev + self.interpolation_alpha * (cmd - prev)
+            if self.max_step_rad > 0.0:
+                delta = np.clip(cmd - prev, -self.max_step_rad, self.max_step_rad)
+                cmd = prev + delta
+        self._last_positions_rad[arm] = cmd.copy()
+        return cmd
+
+    def send_positions_deg(self, arm: str, positions_deg: np.ndarray) -> bool:
+        if not self._initialized or self._controller is None:
+            return False
+
+        arr = np.asarray(positions_deg, dtype=np.float64).reshape(-1)
+        if arr.size < NUM_JOINTS:
+            arr = np.pad(arr, (0, NUM_JOINTS - arr.size), mode="constant")
+        arr = np.nan_to_num(arr[:NUM_JOINTS], nan=0.0, posinf=0.0, neginf=0.0)
+
+        positions_rad = np.deg2rad(arr)
+        positions_rad = self._smooth_positions(arm, positions_rad)
+        packed = positions_rad.tolist() + self._zero_vel + self._zero_eff
+
+        mapping = self.mappings.get(arm, f"{arm}_arm")
+        ok = self._controller.execute(packed, mapping)
+        if not ok:
+            err = self._controller.get_last_error()
+            logger.error(f"{mapping} command streaming failed: {err}")
+            return False
+        return True
 
 
 class RobotROSNode(Node):
@@ -183,9 +320,16 @@ class RobotInterface:
     def __init__(self, config: TelegripConfig):
         self.config = config
         self.require_state_feedback = bool(getattr(config, "require_state_feedback", False))
+        self.command_backend = str(getattr(config, "robot_command_backend", "ros2_topic") or "ros2_topic").strip().lower()
+        self.use_command_streaming = self.command_backend in {"command_streaming", "ipc", "ipc_streaming"}
         self.ros_node = None
+        self.streaming_client = None
         self.is_connected = False
-        self.is_engaged = False
+        # Engagement is managed externally by robot-side ROS2/controller process.
+        # Telegrip does not toggle motor enable/disable anymore.
+        self.is_engaged = True
+        self._last_reconnect_attempt_time = 0.0
+        self._reconnect_interval_s = 1.0
         
         self.left_arm_connected = False
         self.right_arm_connected = False
@@ -226,11 +370,9 @@ class RobotInterface:
         self.max_arm_errors = 3
         self.max_general_errors = 8
         
-        self.initial_left_arm = np.array([90, 30, 90, 90, 90, 0])
-        self.initial_right_arm = np.array([-90, -30, -90, -90, -90, 0])
-    
+
     def connect(self) -> bool:
-        """Connect to robot via ROS2."""
+        """Connect to robot backend."""
         if self.is_connected:
             logger.info("Robot interface already connected")
             return True
@@ -239,18 +381,59 @@ class RobotInterface:
             logger.info("Robot interface disabled in config")
             self.is_connected = True
             return True
-        
-        if not ROS2_AVAILABLE:
-            logger.error("ROS2 not available - cannot connect to robot")
-            return False
-        
+
         try:
-            if not rclpy.ok():
-                rclpy.init()
-            
-            self.ros_node = RobotROSNode(self.config)
-            time.sleep(0.5)
-            
+            # Cleanup stale resources from previous failed sessions.
+            if self.streaming_client is not None:
+                try:
+                    self.streaming_client.disconnect()
+                except Exception:
+                    pass
+                self.streaming_client = None
+
+            if self.ros_node is not None:
+                try:
+                    self.ros_node.destroy_node()
+                except Exception:
+                    pass
+                self.ros_node = None
+
+            # Optional ROS node for /joint_states feedback and startup snapshot.
+            if ROS2_AVAILABLE:
+                try:
+                    if not rclpy.ok():
+                        rclpy.init()
+                    self.ros_node = RobotROSNode(self.config)
+                    time.sleep(0.2)
+                except Exception as ros_err:
+                    self.ros_node = None
+                    if self.require_state_feedback or not self.use_command_streaming:
+                        raise RuntimeError(f"ROS2 node initialization failed: {ros_err}") from ros_err
+                    logger.warning(
+                        f"ROS2 node initialization failed ({ros_err}); "
+                        "continuing with command_streaming backend only"
+                    )
+            elif self.require_state_feedback:
+                logger.error("ROS2 not available but require_state_feedback=True")
+                return False
+
+            if self.use_command_streaming:
+                self.streaming_client = ArmControllerStreamingClient(self.config)
+                if not self.streaming_client.connect():
+                    self.streaming_client = None
+                    self.is_connected = False
+                    return False
+                self.left_arm_connected = True
+                self.right_arm_connected = True
+                self.is_connected = True
+                logger.info("🤖 Robot interface connected via command streaming backend")
+                return True
+
+            # Legacy ROS topic backend.
+            if not ROS2_AVAILABLE:
+                logger.error("ROS2 not available - cannot use ros2_topic backend")
+                return False
+
             self._update_connection_status()
 
             if self.require_state_feedback:
@@ -259,35 +442,58 @@ class RobotInterface:
                 self.left_arm_connected = True
                 self.right_arm_connected = True
                 self.is_connected = True
-            
+
             if self.is_connected:
-                logger.info(f"🤖 Robot interface connected via ROS2: Left={self.left_arm_connected}, Right={self.right_arm_connected}")
+                logger.info(
+                    f"🤖 Robot interface connected via ROS2 topics: "
+                    f"Left={self.left_arm_connected}, Right={self.right_arm_connected}"
+                )
             else:
                 logger.warning("⚠️ ROS2 node created but no arms detected yet")
                 self.is_connected = True
 
             if not self.require_state_feedback:
-                logger.info("✅ Feedback check disabled: publish commands directly to control topics")
-            
+                logger.info("✅ Feedback check disabled: publishing commands without feedback gating")
+
             return True
-            
+
         except Exception as e:
-            logger.error(f"❌ Robot ROS2 connection failed: {e}")
+            logger.error(f"❌ Robot connection failed: {e}")
             self.is_connected = False
             return False
+
+    def _maybe_auto_reconnect(self) -> bool:
+        """Attempt reconnect at a limited rate when backend is disconnected."""
+        if self.is_connected:
+            return True
+        if not self.config.enable_robot:
+            return False
+
+        now = time.time()
+        if now - self._last_reconnect_attempt_time < self._reconnect_interval_s:
+            return False
+        self._last_reconnect_attempt_time = now
+
+        logger.info("🔁 Robot backend disconnected, attempting auto-reconnect...")
+        ok = self.connect()
+        if ok:
+            logger.info("✅ Robot backend reconnected")
+        else:
+            logger.warning("⚠️ Robot backend reconnect failed; will retry automatically")
+        return ok
     
     def _update_connection_status(self):
-        if self.ros_node:
-            if not self.require_state_feedback:
-                self.left_arm_connected = True
-                self.right_arm_connected = True
-                return
+        if not self.require_state_feedback:
+            self.left_arm_connected = True
+            self.right_arm_connected = True
+            return
 
+        if self.ros_node:
             rclpy.spin_once(self.ros_node, timeout_sec=0.01)
             self.ros_node.check_connections()
             self.left_arm_connected = self.ros_node.left_arm_connected
             self.right_arm_connected = self.ros_node.right_arm_connected
-            
+
             if self.left_arm_connected:
                 self.left_arm_angles = self.ros_node.left_arm_angles.copy()
             if self.right_arm_connected:
@@ -640,34 +846,36 @@ class RobotInterface:
             self.right_arm_angles = clamped_angles
     
     def engage(self) -> bool:
-        """Engage robot motors."""
+        """Deprecated no-op: engagement is managed externally."""
         if not self.is_connected:
-            logger.warning("Cannot engage robot: not connected")
+            logger.warning("Robot not connected yet; engage() is deprecated/no-op")
             return False
-        
         self.is_engaged = True
-        logger.info("🔌 Robot motors ENGAGED")
+        logger.info("🔌 engage() ignored (external motor enable is in control)")
         return True
     
     def disengage(self) -> bool:
-        """Disengage robot motors."""
-        if not self.is_connected:
-            logger.info("Robot already disconnected")
-            return True
-        
-        try:
-            self.return_to_initial_position()
-            self.is_engaged = False
-            logger.info("🔌 Robot motors DISENGAGED")
-            return True
-        except Exception as e:
-            logger.error(f"Error disengaging robot: {e}")
-            return False
+        """Deprecated no-op: engagement is managed externally."""
+        self.is_engaged = True
+        logger.info("🔌 disengage() ignored (external motor enable is in control)")
+        return True
     
     def send_command(self) -> bool:
-        """Send joint angles to robot via ROS2."""
-        if not self.is_connected or not self.is_engaged:
+        """Send current commanded joint angles to the active robot backend."""
+        if not self.config.enable_robot:
             return False
+
+        if not self.is_connected:
+            self._maybe_auto_reconnect()
+        if not self.is_connected:
+            return False
+        if self.use_command_streaming and self.streaming_client is None:
+            self.is_connected = False
+            self.left_arm_connected = False
+            self.right_arm_connected = False
+            self._maybe_auto_reconnect()
+            if not self.is_connected or self.streaming_client is None:
+                return False
         
         current_time = time.time()
         if current_time - self.last_send_time < self.config.send_interval:
@@ -677,29 +885,55 @@ class RobotInterface:
             success = True
             if self.require_state_feedback:
                 self._update_connection_status()
-            
-            if self.ros_node and (self.left_arm_connected or not self.require_state_feedback):
-                try:
-                    self.ros_node.publish_command("left", self.left_arm_angles)
-                    self.ros_node.left_arm_angles = self.left_arm_angles.copy()
-                except Exception as e:
-                    logger.error(f"Error sending left arm command: {e}")
-                    self.left_arm_errors += 1
-                    if self.left_arm_errors > self.max_arm_errors:
-                        self.left_arm_connected = False
-                    success = False
-            
-            if self.ros_node and (self.right_arm_connected or not self.require_state_feedback):
-                try:
-                    self.ros_node.publish_command("right", self.right_arm_angles)
-                    self.ros_node.right_arm_angles = self.right_arm_angles.copy()
-                except Exception as e:
-                    logger.error(f"Error sending right arm command: {e}")
-                    self.right_arm_errors += 1
-                    if self.right_arm_errors > self.max_arm_errors:
-                        self.right_arm_connected = False
-                    success = False
-            
+
+            if self.use_command_streaming and self.streaming_client is not None:
+                if self.left_arm_connected or not self.require_state_feedback:
+                    ok_left = self.streaming_client.send_positions_deg("left", self.left_arm_angles)
+                    success = success and ok_left
+                    if not ok_left:
+                        self.left_arm_errors += 1
+                        if self.left_arm_errors > self.max_arm_errors:
+                            self.left_arm_connected = False
+                if self.right_arm_connected or not self.require_state_feedback:
+                    ok_right = self.streaming_client.send_positions_deg("right", self.right_arm_angles)
+                    success = success and ok_right
+                    if not ok_right:
+                        self.right_arm_errors += 1
+                        if self.right_arm_errors > self.max_arm_errors:
+                            self.right_arm_connected = False
+                if not success:
+                    # Force reconnect path on next tick.
+                    try:
+                        self.streaming_client.disconnect()
+                    except Exception:
+                        pass
+                    self.streaming_client = None
+                    self.is_connected = False
+                    self.left_arm_connected = False
+                    self.right_arm_connected = False
+            else:
+                if self.ros_node and (self.left_arm_connected or not self.require_state_feedback):
+                    try:
+                        self.ros_node.publish_command("left", self.left_arm_angles)
+                        self.ros_node.left_arm_angles = self.left_arm_angles.copy()
+                    except Exception as e:
+                        logger.error(f"Error sending left arm command: {e}")
+                        self.left_arm_errors += 1
+                        if self.left_arm_errors > self.max_arm_errors:
+                            self.left_arm_connected = False
+                        success = False
+
+                if self.ros_node and (self.right_arm_connected or not self.require_state_feedback):
+                    try:
+                        self.ros_node.publish_command("right", self.right_arm_angles)
+                        self.ros_node.right_arm_angles = self.right_arm_angles.copy()
+                    except Exception as e:
+                        logger.error(f"Error sending right arm command: {e}")
+                        self.right_arm_errors += 1
+                        if self.right_arm_errors > self.max_arm_errors:
+                            self.right_arm_connected = False
+                        success = False
+
             self.last_send_time = current_time
             return success
             
@@ -768,24 +1002,15 @@ class RobotInterface:
         else:
             self.right_sim_angles = arr.copy()
     
-    def return_to_initial_position(self):
-        """Return arms to initial position."""
-        logger.info("Returning to initial position...")
-        self.left_arm_angles = self.initial_left_arm.copy()
-        self.right_arm_angles = self.initial_right_arm.copy()
-        
-        for _ in range(5):
-            self.send_command()
-            time.sleep(0.1)
-    
     def disconnect(self):
         """Disconnect from robot."""
         if not self.is_connected:
             return
         
         try:
-            if self.is_engaged:
-                self.disengage()
+            if self.streaming_client is not None:
+                self.streaming_client.disconnect()
+                self.streaming_client = None
             
             if self.ros_node:
                 self.ros_node.destroy_node()

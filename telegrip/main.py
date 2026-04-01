@@ -70,6 +70,34 @@ def create_config_from_args(args) -> TelegripConfig:
     config.send_interval = float(robot_cfg.get("send_interval", config.send_interval))
     config.vr_to_robot_scale = float(robot_cfg.get("vr_to_robot_scale", config.vr_to_robot_scale))
     config.require_state_feedback = bool(robot_cfg.get("require_state_feedback", getattr(config, "require_state_feedback", False)))
+    cfg_backend = robot_cfg.get("command_backend", config.robot_command_backend)
+    if cfg_backend is None:
+        left_iface = str(robot_cfg.get("left_arm", {}).get("interface", "")).strip().lower()
+        right_iface = str(robot_cfg.get("right_arm", {}).get("interface", "")).strip().lower()
+        if left_iface in {"command_streaming", "ipc"} or right_iface in {"command_streaming", "ipc"}:
+            cfg_backend = "command_streaming"
+        else:
+            cfg_backend = "ros2_topic"
+    config.robot_command_backend = str(cfg_backend).strip().lower()
+    arm_controller_cfg = robot_cfg.get("arm_controller", {})
+    config.arm_controller_workspace = str(
+        arm_controller_cfg.get("workspace", config.arm_controller_workspace)
+    )
+    config.arm_controller_module_dir = str(
+        arm_controller_cfg.get("module_dir", config.arm_controller_module_dir)
+    )
+    config.arm_controller_left_mapping = str(
+        arm_controller_cfg.get("left_mapping", config.arm_controller_left_mapping)
+    )
+    config.arm_controller_right_mapping = str(
+        arm_controller_cfg.get("right_mapping", config.arm_controller_right_mapping)
+    )
+    config.arm_command_interpolation_alpha = float(
+        arm_controller_cfg.get("interpolation_alpha", config.arm_command_interpolation_alpha)
+    )
+    config.arm_command_max_step_deg = float(
+        arm_controller_cfg.get("max_step_deg", config.arm_command_max_step_deg)
+    )
     config.enable_robot = bool(robot_cfg.get("left_arm", {}).get("enabled", True) or robot_cfg.get("right_arm", {}).get("enabled", True))
 
     config.https_port = int(net_cfg.get("https_port", config.https_port))

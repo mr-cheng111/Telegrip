@@ -72,6 +72,14 @@ network:
 paths:
   urdf_path: mink/examples/arm620/urdf/arm620.urdf
 robot:
+  command_backend: command_streaming
+  arm_controller:
+    workspace: /home/nvidia/Projects/universal-arm-controller
+    module_dir: ""
+    left_mapping: left_arm
+    right_mapping: right_arm
+    interpolation_alpha: 0.35
+    max_step_deg: 6.0
   left_arm:
     enabled: true
     interface: rclpy

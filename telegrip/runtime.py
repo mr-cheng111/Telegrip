@@ -196,9 +196,7 @@ class TelegripSystem:
             logger.info("System restart completed successfully")
 
             if self.config.autoconnect and self.config.enable_robot:
-                logger.info("🔌 Auto-connecting to robot motors after restart...")
-                await asyncio.sleep(0.5)
-                self.add_control_command("robot_connect")
+                logger.info("🔌 Auto-connect command skipped: robot backend now reconnects automatically")
 
         except Exception as e:
             logger.error(f"Error during soft restart sequence: {e}")
@@ -223,9 +221,7 @@ class TelegripSystem:
             logger.info("All system components started successfully")
 
             if self.config.autoconnect and self.config.enable_robot:
-                logger.info("🔌 Auto-connecting to robot motors...")
-                await asyncio.sleep(0.5)
-                self.add_control_command("robot_connect")
+                logger.info("🔌 Auto-connect command skipped: robot backend now reconnects automatically")
 
             while self.is_running:
                 try:

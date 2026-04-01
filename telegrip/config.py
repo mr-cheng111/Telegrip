@@ -40,6 +40,15 @@ DEFAULT_CONFIG = {
             "name": "Right Arm",
             "enabled": True
         },
+        "command_backend": "ros2_topic",
+        "arm_controller": {
+            "workspace": "/home/nvidia/Projects/universal-arm-controller",
+            "module_dir": "",
+            "left_mapping": "left_arm",
+            "right_mapping": "right_arm",
+            "interpolation_alpha": 1.0,
+            "max_step_deg": 0.0,
+        },
         "vr_to_robot_scale": 1.0,
         "send_interval": 0.05,
         "require_state_feedback": False,
@@ -246,6 +255,25 @@ class TelegripConfig:
     vr_to_robot_scale: float = VR_TO_ROBOT_SCALE
     send_interval: float = SEND_INTERVAL
     require_state_feedback: bool = _config_data["robot"].get("require_state_feedback", False)
+    robot_command_backend: str = str(_config_data["robot"].get("command_backend", "ros2_topic"))
+    arm_controller_workspace: str = str(
+        _config_data["robot"].get("arm_controller", {}).get("workspace", "/home/nvidia/Projects/universal-arm-controller")
+    )
+    arm_controller_module_dir: str = str(
+        _config_data["robot"].get("arm_controller", {}).get("module_dir", "")
+    )
+    arm_controller_left_mapping: str = str(
+        _config_data["robot"].get("arm_controller", {}).get("left_mapping", "left_arm")
+    )
+    arm_controller_right_mapping: str = str(
+        _config_data["robot"].get("arm_controller", {}).get("right_mapping", "right_arm")
+    )
+    arm_command_interpolation_alpha: float = float(
+        _config_data["robot"].get("arm_controller", {}).get("interpolation_alpha", 1.0)
+    )
+    arm_command_max_step_deg: float = float(
+        _config_data["robot"].get("arm_controller", {}).get("max_step_deg", 0.0)
+    )
     
     # Control flags
     enable_sim: bool = True
@@ -304,6 +332,11 @@ class TelegripConfig:
                 self.vr_relative_rotation_axis_map = cfg_map.copy()
             else:
                 self.vr_relative_rotation_axis_map = []
+        self.robot_command_backend = str(self.robot_command_backend or "ros2_topic").strip().lower()
+        self.arm_controller_left_mapping = str(self.arm_controller_left_mapping or "left_arm").strip()
+        self.arm_controller_right_mapping = str(self.arm_controller_right_mapping or "right_arm").strip()
+        self.arm_command_interpolation_alpha = float(np.clip(self.arm_command_interpolation_alpha, 0.0, 1.0))
+        self.arm_command_max_step_deg = max(0.0, float(self.arm_command_max_step_deg))
     
     @property
     def ssl_files_exist(self) -> bool:
