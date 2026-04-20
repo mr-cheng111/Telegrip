@@ -541,6 +541,21 @@ class ControlLoop:
                 return sim_pos
         return self.robot_interface.get_current_end_effector_position(arm)
 
+    def _sync_mujoco_from_joint_state(self):
+        """将 /joint_states 反馈回灌到 MuJoCo 当前姿态。"""
+        if not self.visualizer or not self.robot_interface:
+            return
+        if not self.robot_interface.is_motion_gate_ready():
+            return
+
+        left_feedback = self.robot_interface.get_actual_arm_angles("left")
+        right_feedback = self.robot_interface.get_actual_arm_angles("right")
+        synced = self.visualizer.sync_robot_pose_from_feedback(left_feedback, right_feedback)
+        if synced:
+            # 维护一份“仿真侧观测角”，便于无反馈分支与状态面板复用。
+            self.robot_interface.set_simulated_arm_angles("left", left_feedback)
+            self.robot_interface.set_simulated_arm_angles("right", right_feedback)
+
     def _get_current_ee_orientation(self, arm: str) -> np.ndarray:
         """Get current end-effector orientation quaternion [w, x, y, z]."""
         if self.visualizer:
@@ -877,6 +892,10 @@ class ControlLoop:
         """
         if not self.robot_interface or not self.visualizer:
             return
+
+        # 反馈链路：先把真实关节角同步到 MuJoCo，再以该状态做 Mink IK。
+        if self.config.require_state_feedback or bool(getattr(self.config, "require_joint_state_for_motion", False)):
+            self._sync_mujoco_from_joint_state()
 
         ik_requests = {
             "left": None,

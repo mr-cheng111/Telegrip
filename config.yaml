@@ -72,8 +72,12 @@ network:
 paths:
   urdf_path: mink/examples/arm620/urdf/arm620.urdf
 robot:
-  command_backend: command_streaming
+  command_backend: ros2_topic
   require_joint_state_for_motion: true
+  ros2:
+    joint_state_topic: /joint_states
+    left_joint_cmd_topic: /left_arm/joint_commands
+    right_joint_cmd_topic: /right_arm/joint_commands
   arm_controller:
     workspace: /home/nvidia/Projects/universal-arm-controller
     module_dir: ""
@@ -85,7 +89,7 @@ robot:
     enabled: true
     interface: rclpy
     name: Left ARM620
-  require_state_feedback: false
+  require_state_feedback: true
   right_arm:
     enabled: true
     interface: rclpy

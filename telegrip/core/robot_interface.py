@@ -181,12 +181,26 @@ class RobotROSNode(Node):
         self.right_sim_angles = np.zeros(NUM_JOINTS)
         self.left_actual_angles = np.zeros(NUM_JOINTS)
         self.right_actual_angles = np.zeros(NUM_JOINTS)
-        
-        self.left_cmd_pub = self.create_publisher(JointState, '/left_arm/joint_commands', 10)
-        self.right_cmd_pub = self.create_publisher(JointState, '/right_arm/joint_commands', 10)
-        
-        # Subscribe only to aggregated /joint_states and parse by joint names.
-        self.all_state_sub = self.create_subscription(JointState, '/joint_states', self._joint_state_callback, 10)
+
+        self.joint_state_topic = str(
+            getattr(config, "ros2_joint_state_topic", "/joint_states") or "/joint_states"
+        )
+        self.left_joint_cmd_topic = str(
+            getattr(config, "ros2_left_joint_cmd_topic", "/left_arm/joint_commands")
+            or "/left_arm/joint_commands"
+        )
+        self.right_joint_cmd_topic = str(
+            getattr(config, "ros2_right_joint_cmd_topic", "/right_arm/joint_commands")
+            or "/right_arm/joint_commands"
+        )
+
+        self.left_cmd_pub = self.create_publisher(JointState, self.left_joint_cmd_topic, 10)
+        self.right_cmd_pub = self.create_publisher(JointState, self.right_joint_cmd_topic, 10)
+
+        # 订阅聚合 /joint_states，并按关节名解析左右臂反馈。
+        self.all_state_sub = self.create_subscription(
+            JointState, self.joint_state_topic, self._joint_state_callback, 10
+        )
         
         self.left_arm_connected = False
         self.right_arm_connected = False
@@ -200,7 +214,12 @@ class RobotROSNode(Node):
             self.left_arm_connected = True
             self.right_arm_connected = True
         
-        logger.info("ROS2 robot interface node initialized")
+        logger.info(
+            "ROS2 robot interface node initialized: "
+            f"joint_state={self.joint_state_topic}, "
+            f"left_cmd={self.left_joint_cmd_topic}, "
+            f"right_cmd={self.right_joint_cmd_topic}"
+        )
 
     @staticmethod
     def _normalize_joint_state_units(angles: np.ndarray) -> np.ndarray:
@@ -428,6 +447,26 @@ class RobotInterface:
                 self.streaming_client = ArmControllerStreamingClient(self.config)
                 if not self.streaming_client.connect():
                     self.streaming_client = None
+                    # 优先尝试回退到 ROS2 topic 发布链路，避免因 arm_controller_py 缺失导致整链路不可用。
+                    if self.ros_node is not None:
+                        logger.warning(
+                            "CommandStreaming backend unavailable, "
+                            "falling back to ROS2 topic command publishing"
+                        )
+                        self.use_command_streaming = False
+                        self._update_connection_status()
+                        if self.require_state_feedback:
+                            self.is_connected = self.left_arm_connected or self.right_arm_connected
+                        else:
+                            self.left_arm_connected = True
+                            self.right_arm_connected = True
+                            self.is_connected = True
+                        if not self.is_connected:
+                            logger.warning("⚠️ ROS2 fallback enabled but no arm feedback detected yet")
+                            self.is_connected = True
+                        if self.require_joint_state_for_motion:
+                            logger.info("🔒 Motion gate active: waiting for /joint_states before sending commands")
+                        return True
                     self.is_connected = False
                     return False
                 self.left_arm_connected = True

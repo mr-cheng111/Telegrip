@@ -327,6 +327,18 @@ class MuJoCoVisualizer:
         """Set initial arm posture directly in MuJoCo state and desired targets."""
         with self._mujoco_lock:
             self._apply_initial_arm_pose_deg(left_angles_deg, right_angles_deg)
+
+    def sync_robot_pose_from_feedback(self, left_angles_deg: np.ndarray, right_angles_deg: np.ndarray) -> bool:
+        """用真实关节反馈直接同步 MuJoCo 姿态。
+
+        该接口用于 sim2real 回灌链路：
+        `/joint_states -> MuJoCo(qpos) -> Mink IK`。
+        每个控制周期都可调用，确保 IK 的当前状态与真机一致。
+        """
+        if not self.is_connected:
+            return False
+        with self._mujoco_lock:
+            return bool(self._apply_initial_arm_pose_deg(left_angles_deg, right_angles_deg))
     
     def _resolve_mocap_id(self, marker_name: str) -> Optional[int]:
         """Resolve marker name to a mocap body id with single-arm fallbacks."""

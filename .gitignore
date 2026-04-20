@@ -10,3 +10,6 @@ venv/
 # Test/cache
 .pytest_cache/
 .mypy_cache/
+
+# Local Codex marker
+.codex
