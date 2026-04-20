@@ -263,10 +263,14 @@ class ControlLoop:
             
             kinematics_scene_path = get_absolute_path(kinematics_scene)
             scene_name = kinematics_scene_path.name.lower()
+            # 约定：只要场景文件名包含 dual，就走“运行时动态生成双臂 MJCF”分支，
+            # 而不是直接加载静态 XML。这样可避免双臂 include 的命名冲突问题。
             use_dual_generated_scene = "dual" in scene_name
             use_unified_base_scene = False
             if use_dual_generated_scene:
+                # 进一步用 unified 关键字区分“双臂统一底座”与“普通双臂”两种生成器。
                 use_unified_base_scene = "unified" in scene_name
+                # 根据 unified 标志选择对应的临时输出文件，后续可视化与 IK 都加载该文件。
                 dual_scene_path = get_absolute_path(
                     dual_unified_scene_tmp if use_unified_base_scene else dual_scene_tmp
                 )
