@@ -4,7 +4,6 @@ Runtime orchestration for telegrip system lifecycle.
 
 import asyncio
 import logging
-import queue
 import threading
 import subprocess
 from typing import Optional
@@ -24,21 +23,83 @@ class TelegripSystem:
         self.config = config
 
         self.command_queue = asyncio.Queue()
-        self.control_commands_queue = queue.Queue(maxsize=10)
 
         self.https_server = HTTPSServer(config)
         self.vr_server = VRWebSocketServer(self.command_queue, config)
-        self.web_keyboard_handler = None
-        self.control_loop = ControlLoop(self.command_queue, config, self.control_commands_queue)
+        self.control_loop = ControlLoop(self.command_queue, config)
 
         self.https_server.set_system_ref(self)
-
-        self.control_loop.web_keyboard_handler = None
 
         self.tasks = []
         self.is_running = False
         self.main_loop = None
         self.gnirehtet_process: Optional[subprocess.Popen] = None
+
+    async def _cancel_tasks(self, timeout_s: float):
+        """取消当前后台任务并等待退出。"""
+        for task in self.tasks:
+            task.cancel()
+
+        if not self.tasks:
+            return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self.tasks, return_exceptions=True),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Some tasks did not complete within timeout")
+        finally:
+            self.tasks = []
+
+    async def _stop_runtime_components(
+        self,
+        *,
+        stop_control_loop: bool,
+        stop_vr_server: bool,
+        stop_https_server: bool,
+    ):
+        """按需停止运行时组件，供 stop/restart 复用。"""
+        if stop_vr_server:
+            try:
+                await asyncio.wait_for(self.vr_server.stop(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("VR server stop timed out")
+            except Exception as e:
+                logger.warning(f"Error stopping VR server: {e}")
+
+        await self._cancel_tasks(timeout_s=5.0)
+
+        if stop_control_loop:
+            try:
+                await asyncio.wait_for(self.control_loop.stop(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("Control loop stop timed out")
+            except Exception as e:
+                logger.warning(f"Error stopping control loop: {e}")
+
+        if stop_https_server:
+            try:
+                await asyncio.wait_for(self.https_server.stop(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("HTTPS server stop timed out")
+            except Exception as e:
+                logger.warning(f"Error stopping HTTPS server: {e}")
+
+    def _recreate_runtime_components(self):
+        """重建依赖 command_queue 的运行时组件。"""
+        self.command_queue = asyncio.Queue()
+        self.vr_server = VRWebSocketServer(self.command_queue, self.config)
+        self.control_loop = ControlLoop(self.command_queue, self.config)
+
+    async def _start_runtime_components(self, *, start_https_server: bool):
+        """启动运行时组件，供 start/restart 复用。"""
+        if start_https_server:
+            await self.https_server.start()
+
+        await self.vr_server.start()
+        self.tasks.append(asyncio.create_task(self.control_loop.start()))
 
     def _start_gnirehtet(self):
         """Start gnirehtet reverse tethering process if enabled."""
@@ -89,47 +150,6 @@ class TelegripSystem:
         finally:
             self.gnirehtet_process = None
 
-    def add_control_command(self, action: str):
-        """Add a control command to the queue for processing."""
-        try:
-            command = {"action": action}
-            logger.info(f"🔌 Queueing control command: {command}")
-            self.control_commands_queue.put_nowait(command)
-            logger.info("🔌 Command queued successfully")
-        except queue.Full:
-            logger.warning(f"Control commands queue is full, dropping command: {action}")
-        except Exception as e:
-            logger.error(f"🔌 Error queuing command: {e}")
-
-    def add_keypress_command(self, command: dict):
-        """Add a keypress command to the queue for processing."""
-        try:
-            logger.info(f"🎮 Queueing keypress command: {command}")
-            self.control_commands_queue.put_nowait(command)
-            logger.info("🎮 Keypress command queued successfully")
-        except queue.Full:
-            logger.warning(f"Control commands queue is full, dropping keypress command: {command}")
-        except Exception as e:
-            logger.error(f"🎮 Error queuing keypress command: {e}")
-
-    async def process_control_commands(self):
-        """Process control commands from the thread-safe queue."""
-        try:
-            commands_to_process = []
-            while True:
-                try:
-                    command = self.control_commands_queue.get_nowait()
-                    commands_to_process.append(command)
-                except queue.Empty:
-                    break
-
-            for command in commands_to_process:
-                if self.control_loop:
-                    await self.control_loop._handle_command(command)
-
-        except Exception as e:
-            logger.error(f"Error processing control commands: {e}")
-
     def restart(self):
         """Restart the teleoperation system."""
 
@@ -152,46 +172,17 @@ class TelegripSystem:
         try:
             logger.info("Starting soft restart sequence...")
             await asyncio.sleep(1)
-
-            for task in self.tasks:
-                task.cancel()
-
-            if self.tasks:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*self.tasks, return_exceptions=True),
-                        timeout=5.0
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("Some tasks did not complete within timeout")
-
-            await self.control_loop.stop()
-            await self.vr_server.stop()
+            await self._stop_runtime_components(
+                stop_control_loop=True,
+                stop_vr_server=True,
+                stop_https_server=False,
+            )
 
             await asyncio.sleep(1)
 
-            from .config import get_config_data
-            file_config = get_config_data()
             logger.info("Configuration reloaded from file")
-
-            self.command_queue = asyncio.Queue()
-            self.control_commands_queue = queue.Queue(maxsize=10)
-
-            self.vr_server = VRWebSocketServer(self.command_queue, self.config)
-            self.web_keyboard_handler = None
-            self.control_loop = ControlLoop(self.command_queue, self.config, self.control_commands_queue)
-
-            self.control_loop.web_keyboard_handler = None
-
-            self.tasks = []
-
-            await self.vr_server.start()
-
-            control_task = asyncio.create_task(self.control_loop.start())
-            self.tasks.append(control_task)
-
-            command_processor_task = asyncio.create_task(self._run_command_processor())
-            self.tasks.append(command_processor_task)
+            self._recreate_runtime_components()
+            await self._start_runtime_components(start_https_server=False)
 
             logger.info("System restart completed successfully")
 
@@ -208,15 +199,7 @@ class TelegripSystem:
             self.is_running = True
             self.main_loop = asyncio.get_event_loop()
             self._start_gnirehtet()
-
-            await self.https_server.start()
-            await self.vr_server.start()
-
-            control_task = asyncio.create_task(self.control_loop.start())
-            self.tasks.append(control_task)
-
-            command_processor_task = asyncio.create_task(self._run_command_processor())
-            self.tasks.append(command_processor_task)
+            await self._start_runtime_components(start_https_server=True)
 
             logger.info("All system components started successfully")
 
@@ -250,50 +233,16 @@ class TelegripSystem:
             await self.stop()
             raise
 
-    async def _run_command_processor(self):
-        """Run the control command processor loop."""
-        while self.is_running:
-            await self.process_control_commands()
-            await asyncio.sleep(0.05)
-
     async def stop(self):
         """Stop all system components."""
         logger.info("Shutting down teleoperation system...")
         self.is_running = False
         self._stop_gnirehtet()
-
-        try:
-            await asyncio.wait_for(self.vr_server.stop(), timeout=2.0)
-        except asyncio.TimeoutError:
-            logger.warning("VR server stop timed out")
-        except Exception as e:
-            logger.warning(f"Error stopping VR server: {e}")
-
-        for task in self.tasks:
-            task.cancel()
-
-        if self.tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*self.tasks, return_exceptions=True),
-                    timeout=2.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Some tasks did not complete within timeout")
-
-        try:
-            await asyncio.wait_for(self.control_loop.stop(), timeout=3.0)
-        except asyncio.TimeoutError:
-            logger.warning("Control loop stop timed out")
-        except Exception as e:
-            logger.warning(f"Error stopping control loop: {e}")
-
-        try:
-            await asyncio.wait_for(self.https_server.stop(), timeout=2.0)
-        except asyncio.TimeoutError:
-            logger.warning("HTTPS server stop timed out")
-        except Exception as e:
-            logger.warning(f"Error stopping HTTPS server: {e}")
+        await self._stop_runtime_components(
+            stop_control_loop=True,
+            stop_vr_server=True,
+            stop_https_server=True,
+        )
 
         logger.info("Teleoperation system shutdown complete")
 

@@ -27,7 +27,7 @@ class TeleopFrameMapperConfig:
     relative_rotation_post_axis_map: np.ndarray = field(
         default_factory=lambda: np.eye(3, dtype=float)
     )
-    ee_target_orientation_correction_euler_xyz_deg: tuple[float, float, float] = (-90.0, 0.0, 0.0)
+    ee_target_orientation_correction_euler_xyz_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 class TeleopFrameMapper:
@@ -68,14 +68,30 @@ class TeleopFrameMapper:
         只修改这里即可。
         """
         relative_rotation_post_axis_map = cls.parse_axis_remap_matrix(
-            getattr(telegrip_config, "vr_relative_rotation_axis_map", [])
+            getattr(telegrip_config, "teleop_frame_relative_rotation_axis_map", [])
+        )
+        translation_euler_xyz_deg = tuple(
+            float(v)
+            for v in getattr(
+                telegrip_config,
+                "teleop_frame_translation_euler_xyz_deg",
+                [0.0, 0.0, 180.0],
+            )[:3]
+        )
+        ee_target_orientation_correction_euler_xyz_deg = tuple(
+            float(v)
+            for v in getattr(
+                telegrip_config,
+                "teleop_frame_ee_target_orientation_correction_euler_xyz_deg",
+                [0.0, 0.0, 0.0],
+            )[:3]
         )
         return cls(
             TeleopFrameMapperConfig(
-                translation_euler_xyz_deg=(0.0, 0.0, 180.0),
+                translation_euler_xyz_deg=translation_euler_xyz_deg,
                 controller_delta_to_target_axis_map=np.eye(3, dtype=float),
                 relative_rotation_post_axis_map=relative_rotation_post_axis_map,
-                ee_target_orientation_correction_euler_xyz_deg=(-90.0, 0.0, 0.0),
+                ee_target_orientation_correction_euler_xyz_deg=ee_target_orientation_correction_euler_xyz_deg,
             )
         )
 

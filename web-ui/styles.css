@@ -174,54 +174,6 @@ body {
   color: white;
 }
 
-/* Keyboard help section */
-.keyboard-help {
-  background: rgba(255, 255, 255, 0.9);
-  border-radius: 10px;
-  padding: 20px;
-  margin-top: 20px;
-  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-  transition: all 0.3s ease;
-}
-
-.keyboard-help.active {
-  background: rgba(76, 175, 80, 0.1);
-  border: 2px solid #4CAF50;
-  box-shadow: 0 4px 20px rgba(76, 175, 80, 0.3);
-}
-
-.keyboard-help.active .help-title {
-  color: #2E7D32;
-}
-
-.keyboard-help-header {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 15px;
-}
-
-.keyboard-help-expanded {
-  display: none;
-}
-
-.keyboard-help.active .keyboard-help-expanded {
-  display: block;
-}
-
-.keyboard-help-collapsed {
-  display: block;
-}
-
-.keyboard-help-collapsed .control-toggle {
-  display: inline-flex;
-  width: auto;
-}
-
-.keyboard-help.active .keyboard-help-collapsed {
-  display: none;
-}
-
 .help-title {
   font-size: 18px;
   font-weight: bold;

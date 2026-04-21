@@ -25,7 +25,6 @@ def parse_arguments():
     parser.add_argument("--no-sim", action="store_true", help="Disable simulation and inverse kinematics")
     parser.add_argument("--no-viz", action="store_true", help="Disable GUI visualization (headless mode)")
     parser.add_argument("--no-vr", action="store_true", help="Disable VR WebSocket server")
-    parser.add_argument("--no-keyboard", action="store_true", help="Deprecated (keyboard control has been removed)")
     parser.add_argument("--no-https", action="store_true", help="Disable HTTPS server")
     parser.add_argument("--autoconnect", action="store_true", help="Automatically connect to robot motors on startup")
     parser.add_argument("--log-level", default="info",
@@ -63,8 +62,8 @@ def create_config_from_args(args) -> TelegripConfig:
     ik_cfg = config_data.get("ik", {})
     gnirehtet_cfg = config_data.get("gnirehtet", {})
 
-    keyboard_cfg = control_cfg.get("keyboard", {})
     vr_cfg = control_cfg.get("vr", {})
+    teleop_frame_cfg = control_cfg.get("teleop_frame", {})
     mink_cfg = control_cfg.get("mink", {})
 
     config.send_interval = float(robot_cfg.get("send_interval", config.send_interval))
@@ -116,13 +115,33 @@ def create_config_from_args(args) -> TelegripConfig:
     config.urdf_path = str(path_cfg.get("urdf_path", config.urdf_path))
     config.webapp_dir = str(path_cfg.get("webapp_dir", config.webapp_dir))
 
-    config.enable_keyboard = False
     config.enable_vr = bool(vr_cfg.get("enabled", config.enable_vr))
     config.vr_orientation_reference_mode = str(
         vr_cfg.get("orientation_reference_mode", config.vr_orientation_reference_mode)
     )
-    rr_axis_map = vr_cfg.get("relative_rotation_axis_map", config.vr_relative_rotation_axis_map)
-    config.vr_relative_rotation_axis_map = rr_axis_map if isinstance(rr_axis_map, list) else []
+    translation_euler = teleop_frame_cfg.get(
+        "translation_euler_xyz_deg",
+        config.teleop_frame_translation_euler_xyz_deg,
+    )
+    config.teleop_frame_translation_euler_xyz_deg = (
+        translation_euler if isinstance(translation_euler, list) else config.teleop_frame_translation_euler_xyz_deg
+    )
+    rr_axis_map = teleop_frame_cfg.get(
+        "relative_rotation_axis_map",
+        config.teleop_frame_relative_rotation_axis_map,
+    )
+    config.teleop_frame_relative_rotation_axis_map = (
+        rr_axis_map if isinstance(rr_axis_map, list) else config.teleop_frame_relative_rotation_axis_map
+    )
+    ee_orientation_correction = teleop_frame_cfg.get(
+        "ee_target_orientation_correction_euler_xyz_deg",
+        config.teleop_frame_ee_target_orientation_correction_euler_xyz_deg,
+    )
+    config.teleop_frame_ee_target_orientation_correction_euler_xyz_deg = (
+        ee_orientation_correction
+        if isinstance(ee_orientation_correction, list)
+        else config.teleop_frame_ee_target_orientation_correction_euler_xyz_deg
+    )
     config.enable_gui = bool(control_cfg.get("enable_gui", config.enable_gui))
     config.enable_sim = bool(control_cfg.get("enable_sim", config.enable_sim))
     # If simulation is disabled, GUI must also be disabled.
@@ -144,10 +163,6 @@ def create_config_from_args(args) -> TelegripConfig:
     config.mink_orientation_error_threshold = float(
         mink_cfg.get("orientation_error_threshold", config.mink_orientation_error_threshold)
     )
-    config.pos_step = float(keyboard_cfg.get("pos_step", config.pos_step))
-    config.angle_step = float(keyboard_cfg.get("angle_step", config.angle_step))
-    config.gripper_step = float(keyboard_cfg.get("gripper_step", config.gripper_step))
-
     config.gripper_open_angle = float(gripper_cfg.get("open_angle", config.gripper_open_angle))
     config.gripper_closed_angle = float(gripper_cfg.get("closed_angle", config.gripper_closed_angle))
 
@@ -182,8 +197,6 @@ def create_config_from_args(args) -> TelegripConfig:
         config.enable_gui = False
     if args.no_vr:
         config.enable_vr = False
-    if args.no_keyboard:
-        config.enable_keyboard = False
     config.autoconnect = args.autoconnect
     config.log_level = args.log_level
 

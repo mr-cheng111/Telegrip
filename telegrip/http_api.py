@@ -60,12 +60,8 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(404, "Not found")
 
     def do_POST(self):
-        if self.path == '/api/keyboard':
-            self.handle_keyboard_request()
-        elif self.path == '/api/robot':
+        if self.path == '/api/robot':
             self.handle_robot_request()
-        elif self.path == '/api/keypress':
-            self.handle_keypress_request()
         elif self.path == '/api/config':
             self.handle_config_post_request()
         elif self.path == '/api/restart':
@@ -90,7 +86,6 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
 
             status = {
                 **control_status,
-                "keyboardEnabled": False,
                 "robotEngaged": robot_engaged,
                 "vrConnected": vr_connected
             }
@@ -99,15 +94,6 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             logger.error(f"Error handling status request: {e}")
             self.send_error(500, str(e))
-
-    def handle_keyboard_request(self):
-        self._send_json_response(
-            {
-                "success": False,
-                "error": "Keyboard control has been removed"
-            },
-            status=410,
-        )
 
     def handle_robot_request(self):
         try:
@@ -129,15 +115,6 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             logger.error(f"Error handling robot request: {e}")
             self.send_error(500, str(e))
-
-    def handle_keypress_request(self):
-        self._send_json_response(
-            {
-                "success": False,
-                "error": "Keyboard control has been removed"
-            },
-            status=410,
-        )
 
     def handle_config_get_request(self):
         try:

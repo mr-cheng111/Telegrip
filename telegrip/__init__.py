@@ -1,5 +1,5 @@
 """
-telegrip - VR and keyboard teleoperation for robotic arms using Mink+MuJoCo.
+telegrip - VR teleoperation for robotic arms using Mink+MuJoCo.
 """
 
 from .core.robot_interface import RobotInterface

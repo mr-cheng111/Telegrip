@@ -7,10 +7,8 @@ import asyncio
 import numpy as np
 import logging
 import time
-import queue  # Add import for thread-safe queue
-import sys
+from dataclasses import dataclass, field
 from typing import Dict, Optional
-from pathlib import Path
 
 from .config import TelegripConfig, NUM_JOINTS, WRIST_FLEX_INDEX, WRIST_ROLL_INDEX, GRIPPER_INDEX
 from .core.robot_interface import RobotInterface
@@ -25,28 +23,29 @@ logger = logging.getLogger(__name__)
 CONTROL_HZ = 200.0
 CONTROL_DT = 1.0 / CONTROL_HZ
 IK_TARGET_SMOOTHING = 1.0
+ARM_NAMES = ("left", "right")
 
 
-class ArmState:
-    """State tracking for a single robot arm."""
-    
-    def __init__(self, arm_name: str):
-        self.arm_name = arm_name
-        self.mode = ControlMode.IDLE
-        self.target_position = None
-        self.target_orientation_quat = None
-        self.origin_target_orientation_quat = None
-        self.goal_position = None  # For visualization
-        self.origin_position = None  # Robot position when grip was activated
-        self.origin_wrist_roll_angle = 0.0
-        self.origin_wrist_flex_angle = 0.0
-        self.current_wrist_roll = 0.0
-        self.current_wrist_flex = 0.0
-        self.last_mocap_target_position = None
-        self.last_mocap_target_quaternion = None
-        
+@dataclass
+class ArmRuntimeState:
+    """单臂运行态。统一收拢 teleop 控制过程中所有会变化的机械臂状态。"""
+
+    arm_name: str
+    mode: ControlMode = ControlMode.IDLE
+    target_position: Optional[np.ndarray] = None
+    target_orientation_quat: Optional[np.ndarray] = None
+    origin_target_orientation_quat: Optional[np.ndarray] = None
+    goal_position: Optional[np.ndarray] = None
+    origin_position: Optional[np.ndarray] = None
+    origin_wrist_roll_angle: float = 0.0
+    origin_wrist_flex_angle: float = 0.0
+    current_wrist_roll: float = 0.0
+    current_wrist_flex: float = 0.0
+    last_mocap_target_position: Optional[np.ndarray] = None
+    last_mocap_target_quaternion: Optional[np.ndarray] = None
+
     def reset(self):
-        """Reset arm state to idle."""
+        """完全重置单臂运行态。"""
         self.mode = ControlMode.IDLE
         self.target_position = None
         self.target_orientation_quat = None
@@ -55,26 +54,62 @@ class ArmState:
         self.origin_position = None
         self.origin_wrist_roll_angle = 0.0
         self.origin_wrist_flex_angle = 0.0
+        self.current_wrist_roll = 0.0
+        self.current_wrist_flex = 0.0
         self.last_mocap_target_position = None
         self.last_mocap_target_quaternion = None
+
+    def clear_target_state(self):
+        """清空当前位置控制相关目标，但保留当前 wrist 实时值。"""
+        self.mode = ControlMode.IDLE
+        self.target_position = None
+        self.target_orientation_quat = None
+        self.origin_target_orientation_quat = None
+        self.goal_position = None
+        self.origin_position = None
+        self.origin_wrist_roll_angle = 0.0
+        self.origin_wrist_flex_angle = 0.0
+
+    def seed_from_pose(
+        self,
+        position: np.ndarray,
+        quat_wxyz: np.ndarray,
+        wrist_roll_deg: float,
+        wrist_flex_deg: float,
+    ):
+        """用当前机械臂姿态重置控制目标，避免进入控制时第一帧跳变。"""
+        self.target_position = np.asarray(position, dtype=float).copy()
+        self.goal_position = np.asarray(position, dtype=float).copy()
+        self.target_orientation_quat = np.asarray(quat_wxyz, dtype=float).copy()
+        self.origin_target_orientation_quat = np.asarray(quat_wxyz, dtype=float).copy()
+        self.origin_position = np.asarray(position, dtype=float).copy()
+        self.current_wrist_roll = float(wrist_roll_deg)
+        self.current_wrist_flex = float(wrist_flex_deg)
+        self.origin_wrist_roll_angle = float(wrist_roll_deg)
+        self.origin_wrist_flex_angle = float(wrist_flex_deg)
+
+    def record_mocap(self, position: np.ndarray, quat_wxyz: np.ndarray):
+        """记录当前 marker/mocap 对齐结果，供下一帧复用。"""
+        self.last_mocap_target_position = np.asarray(position, dtype=float).copy()
+        self.last_mocap_target_quaternion = np.asarray(quat_wxyz, dtype=float).copy()
 
 
 class ControlLoop:
     """Main control loop that processes command queue and controls robot."""
     
-    def __init__(self, command_queue: asyncio.Queue, config: TelegripConfig, control_commands_queue: Optional[queue.Queue] = None):
+    def __init__(self, command_queue: asyncio.Queue, config: TelegripConfig):
         self.command_queue = command_queue
-        self.control_commands_queue = control_commands_queue
         self.config = config
         
         # Components
         self.robot_interface = None
         self.visualizer = None
-        self.web_keyboard_handler = None  # Optional external input handler reference
         
         # Arm states
-        self.left_arm = ArmState("left")
-        self.right_arm = ArmState("right")
+        self.arm_states = {
+            arm: ArmRuntimeState(arm_name=arm)
+            for arm in ARM_NAMES
+        }
         
         # Control timing
         self.last_log_time = 0
@@ -94,11 +129,11 @@ class ControlLoop:
         self.is_running = False
         # 所有 teleop 相关的平移/姿态补偿统一收拢到 TeleopFrameMapper。
         relative_rotation_post_axis_map = TeleopFrameMapper.parse_axis_remap_matrix(
-            getattr(self.config, "vr_relative_rotation_axis_map", [])
+            getattr(self.config, "teleop_frame_relative_rotation_axis_map", [])
         )
         if not np.allclose(relative_rotation_post_axis_map, np.eye(3), atol=1e-9):
             logger.info(
-                "Using vr.relative_rotation_axis_map:\n"
+                "Using teleop_frame.relative_rotation_axis_map:\n"
                 f"{relative_rotation_post_axis_map}"
             )
         self.frame_mapper = TeleopFrameMapper.from_telegrip_config(self.config)
@@ -202,51 +237,19 @@ class ControlLoop:
         try:
             from .core.visualizer import MuJoCoVisualizer
             from .utils import get_absolute_path
-
-            # Import dual-scene builder from local mink/examples directory.
-            examples_path = Path(__file__).resolve().parents[1] / "mink" / "examples"
-            if str(examples_path) not in sys.path:
-                sys.path.insert(0, str(examples_path))
-            from arm620.scene_dual_builder import save_dual_arm620_xml
-            from arm620.scene_dual_unified_base_builder import save_dual_unified_xml
             
             # Kinematics scene and end-effector site are configurable.
             kinematics_scene = self.config.mink_mujoco_scene
             end_effector_site = self.config.end_effector_site
-
-            # Visualization scene follows config. For generated dual ARM620 scenes, write temp XML.
-            dual_scene_tmp = 'mink/examples/arm620/_tmp_dual_saved.xml'
-            dual_unified_scene_tmp = 'mink/examples/arm620/_tmp_dual_unified_saved.xml'
             
             kinematics_scene_path = get_absolute_path(kinematics_scene)
             scene_name = kinematics_scene_path.name.lower()
-            # 约定：只要场景文件名包含 dual，就走“运行时动态生成双臂 MJCF”分支，
-            # 而不是直接加载静态 XML。这样可避免双臂 include 的命名冲突问题。
-            use_dual_generated_scene = "dual" in scene_name
-            use_unified_base_scene = False
-            if use_dual_generated_scene:
-                # 进一步用 unified 关键字区分“双臂统一底座”与“普通双臂”两种生成器。
-                use_unified_base_scene = "unified" in scene_name
-                # 根据 unified 标志选择对应的临时输出文件，后续可视化与 IK 都加载该文件。
-                dual_scene_path = get_absolute_path(
-                    dual_unified_scene_tmp if use_unified_base_scene else dual_scene_tmp
-                )
-                dual_scene_path.parent.mkdir(parents=True, exist_ok=True)
-                if use_unified_base_scene:
-                    save_dual_unified_xml(dual_scene_path)
-                else:
-                    save_dual_arm620_xml(dual_scene_path)
-                visualizer_scene_path = dual_scene_path
-                # Keep IK and visualization in the same world/model frame.
-                kinematics_scene_path = dual_scene_path
-                logger.info(
-                    "Dual visualization enabled: using generated "
-                    f"{'unified-base ' if use_unified_base_scene else ''}"
-                    "dual scene for Mink IK "
-                    f"({kinematics_scene_path.name})"
-                )
-            else:
-                visualizer_scene_path = kinematics_scene_path
+            use_unified_base_scene = "unified" in scene_name
+            visualizer_scene_path = kinematics_scene_path
+            logger.info(
+                "Using fixed MuJoCo scene file directly for visualization and Mink IK: "
+                f"{kinematics_scene_path}"
+            )
             
             visualizer_startup_pose = None
             if (
@@ -334,11 +337,6 @@ class ControlLoop:
             for i, error in enumerate(setup_errors, 1):
                 logger.error(f"  {i}. {error}")
         
-        # Pass robot interface to external input handler if present.
-        if self.web_keyboard_handler and self.robot_interface:
-            self.web_keyboard_handler.set_robot_interface(self.robot_interface)
-            logger.info("Set robot interface on web keyboard handler")
-
         logger.info(f"Setup completed with success={success}")
         return success
     
@@ -360,17 +358,7 @@ class ControlLoop:
             try:
                 # Process command queue
                 await self._process_commands()
-
-                # Unified control architecture:
-                # Input layer only updates goals; simulation layer executes full
-                # marker -> IK -> joint target -> torque sim in one loop tick.
-                if self.visualizer and self.config.use_mink:
-                    self._simulation_tick_unified()
-                else:
-                    # Fallback for non-sim/legacy paths.
-                    self._update_robot_safely()
-                    if self.visualizer:
-                        self._update_visualization()
+                self._control_tick()
                 
                 # Periodic logging
                 self._tick_counter += 1
@@ -404,6 +392,39 @@ class ControlLoop:
 
         if self.visualizer:
             self.visualizer.disconnect()
+
+    def _control_tick(self):
+        """
+        单帧控制入口。
+
+        固定流程：
+            1. 根据需要把 /joint_states 回灌到 MuJoCo
+            2. 基于当前 arm_state 构建 IK 请求
+            3. 执行双臂 IK 并更新命令角
+            4. 更新可视化/仿真状态
+            5. 发布真实机器人命令
+
+        这样避免旧实现中 `_simulation_tick_unified`、`_update_robot`
+        和 `_update_visualization` 三套流程并行维护。
+        """
+        if not self.robot_interface:
+            return
+
+        if self.visualizer and (
+            self.config.require_state_feedback
+            or bool(getattr(self.config, "require_joint_state_for_motion", False))
+        ):
+            self._sync_mujoco_from_joint_state()
+
+        if self.config.use_mink and self.visualizer:
+            ik_requests = {
+                arm: self._build_ik_request_for_arm(arm, self.arm_states[arm])
+                for arm in ARM_NAMES
+            }
+            self._execute_dual_ik_requests(ik_requests)
+
+        self._update_visualizer_state()
+        self._publish_robot_command()
     
     def _initialize_arm_states(self):
         """Initialize arm states with current robot positions."""
@@ -415,78 +436,53 @@ class ControlLoop:
                 and not self.config.require_state_feedback
                 and not getattr(self.config, "require_joint_state_for_motion", False)
             ):
-                l_sim = self.visualizer.get_joint_angles_deg("left")
-                r_sim = self.visualizer.get_joint_angles_deg("right")
-                if l_sim is not None:
-                    self.robot_interface.left_arm_angles = l_sim.copy()
-                    self.robot_interface.set_simulated_arm_angles("left", l_sim)
-                if r_sim is not None:
-                    self.robot_interface.right_arm_angles = r_sim.copy()
-                    self.robot_interface.set_simulated_arm_angles("right", r_sim)
-
-            # Get current end effector positions
-            left_pos = self._get_current_ee_position("left")
-            right_pos = self._get_current_ee_position("right")
-            
-            # Initialize target positions to current positions (ensure deep copies)
-            self.left_arm.target_position = left_pos.copy()
-            self.left_arm.goal_position = left_pos.copy()
-            self.left_arm.target_orientation_quat = self._get_current_ee_orientation("left")
-            self.left_arm.origin_target_orientation_quat = self.left_arm.target_orientation_quat.copy()
-            self.right_arm.target_position = right_pos.copy()
-            self.right_arm.goal_position = right_pos.copy()
-            self.right_arm.target_orientation_quat = self._get_current_ee_orientation("right")
-            self.right_arm.origin_target_orientation_quat = self.right_arm.target_orientation_quat.copy()
-            
-            # Get current wrist roll angles
-            left_angles = self.robot_interface.get_arm_angles("left")
-            right_angles = self.robot_interface.get_arm_angles("right")
-            
-            self.left_arm.current_wrist_roll = left_angles[WRIST_ROLL_INDEX]
-            self.right_arm.current_wrist_roll = right_angles[WRIST_ROLL_INDEX]
-            
-            self.left_arm.current_wrist_flex = left_angles[WRIST_FLEX_INDEX]
-            self.right_arm.current_wrist_flex = right_angles[WRIST_FLEX_INDEX]
+                for arm in ARM_NAMES:
+                    sim_angles = self.visualizer.get_joint_angles_deg(arm)
+                    if sim_angles is not None:
+                        if arm == "left":
+                            self.robot_interface.left_arm_angles = sim_angles.copy()
+                        else:
+                            self.robot_interface.right_arm_angles = sim_angles.copy()
+                        self.robot_interface.set_simulated_arm_angles(arm, sim_angles)
 
             # Always align simulation mocap targets with current tools_link at startup.
             if self.visualizer:
-                # Keep mocap target pose fully aligned with current tools_link
-                # (both position and orientation), similar to mink example behavior.
-                self.visualizer.update_marker_position(
-                    "left_target", left_pos, self.left_arm.target_orientation_quat
-                )
-                self.visualizer.update_marker_position(
-                    "right_target", right_pos, self.right_arm.target_orientation_quat
-                )
-                # Optional goal markers follow initial target too.
-                self.visualizer.update_marker_position("left_goal", left_pos)
-                self.visualizer.update_marker_position("right_goal", right_pos)
+                for arm in ARM_NAMES:
+                    arm_state = self.arm_states[arm]
+                    current_pos, current_quat, current_angles = self._capture_current_arm_pose(arm)
+                    arm_state.seed_from_pose(
+                        position=current_pos,
+                        quat_wxyz=current_quat,
+                        wrist_roll_deg=current_angles[WRIST_ROLL_INDEX],
+                        wrist_flex_deg=current_angles[WRIST_FLEX_INDEX],
+                    )
+                    self.visualizer.update_marker_position(
+                        f"{arm}_target", current_pos, arm_state.target_orientation_quat
+                    )
+                    self.visualizer.update_marker_position(f"{arm}_goal", current_pos)
+                    arm_state.record_mocap(current_pos, arm_state.target_orientation_quat)
 
-                # Prevent first control ticks from being misdetected as "viewer drag changed".
-                self.left_arm.last_mocap_target_position = left_pos.copy()
-                self.right_arm.last_mocap_target_position = right_pos.copy()
-                self.left_arm.last_mocap_target_quaternion = self.left_arm.target_orientation_quat.copy()
-                self.right_arm.last_mocap_target_quaternion = self.right_arm.target_orientation_quat.copy()
+                    mocap_q = self.visualizer.get_mocap_quaternion(f"{arm}_target")
+                    if mocap_q is not None:
+                        err = self._quat_angle_error_deg_wxyz(
+                            arm_state.target_orientation_quat, mocap_q
+                        )
+                        logger.info(
+                            f"Init frame alignment {arm.upper()} tools_link vs {arm}_target: {err:.3f} deg"
+                        )
 
-                l_mocap_q = self.visualizer.get_mocap_quaternion("left_target")
-                r_mocap_q = self.visualizer.get_mocap_quaternion("right_target")
-                if l_mocap_q is not None:
-                    l_err = self._quat_angle_error_deg_wxyz(
-                        self.left_arm.target_orientation_quat, l_mocap_q
+                    logger.info(f"Initialized {arm} arm at position: {current_pos.round(3)}")
+            else:
+                for arm in ARM_NAMES:
+                    arm_state = self.arm_states[arm]
+                    current_pos, current_quat, current_angles = self._capture_current_arm_pose(arm)
+                    arm_state.seed_from_pose(
+                        position=current_pos,
+                        quat_wxyz=current_quat,
+                        wrist_roll_deg=current_angles[WRIST_ROLL_INDEX],
+                        wrist_flex_deg=current_angles[WRIST_FLEX_INDEX],
                     )
-                    logger.info(
-                        f"Init frame alignment LEFT tools_link vs left_target: {l_err:.3f} deg"
-                    )
-                if r_mocap_q is not None:
-                    r_err = self._quat_angle_error_deg_wxyz(
-                        self.right_arm.target_orientation_quat, r_mocap_q
-                    )
-                    logger.info(
-                        f"Init frame alignment RIGHT tools_link vs right_target: {r_err:.3f} deg"
-                    )
-            
-            logger.info(f"Initialized left arm at position: {left_pos.round(3)}")
-            logger.info(f"Initialized right arm at position: {right_pos.round(3)}")
+                    logger.info(f"Initialized {arm} arm at position: {current_pos.round(3)}")
 
     def _get_current_ee_position(self, arm: str) -> np.ndarray:
         """Get current end-effector position, preferring simulation state."""
@@ -542,19 +538,12 @@ class ControlLoop:
         dot = float(np.clip(abs(np.dot(q_ref, q_meas)), 0.0, 1.0))
         return float(np.degrees(2.0 * np.arccos(dot)))
 
-    def _get_arm_state(self, arm: str) -> ArmState:
-        return self.left_arm if arm == "left" else self.right_arm
+    def _get_arm_state(self, arm: str) -> ArmRuntimeState:
+        return self.arm_states[arm]
 
-    def _clear_arm_target_state(self, arm_state: ArmState):
+    def _clear_arm_target_state(self, arm_state: ArmRuntimeState):
         """清空单臂当前位置控制相关状态。"""
-        arm_state.mode = ControlMode.IDLE
-        arm_state.target_position = None
-        arm_state.target_orientation_quat = None
-        arm_state.origin_target_orientation_quat = None
-        arm_state.goal_position = None
-        arm_state.origin_position = None
-        arm_state.origin_wrist_roll_angle = 0.0
-        arm_state.origin_wrist_flex_angle = 0.0
+        arm_state.clear_target_state()
 
     def _capture_current_arm_pose(self, arm: str):
         """抓取当前末端位姿与关节角，作为状态切换的统一输入。"""
@@ -563,7 +552,7 @@ class ControlLoop:
         current_angles = self.robot_interface.get_arm_angles(arm) if self.robot_interface else None
         return current_position, current_quat, current_angles
 
-    def _seed_arm_target_from_current_pose(self, arm: str, arm_state: ArmState):
+    def _seed_arm_target_from_current_pose(self, arm: str, arm_state: ArmRuntimeState):
         """
         用当前机械臂姿态重置控制目标。
 
@@ -576,20 +565,16 @@ class ControlLoop:
             return
 
         current_position, current_quat, current_angles = self._capture_current_arm_pose(arm)
-        arm_state.target_position = current_position.copy()
-        arm_state.goal_position = current_position.copy()
-        arm_state.target_orientation_quat = current_quat.copy()
-        arm_state.origin_target_orientation_quat = current_quat.copy()
-        arm_state.origin_position = current_position.copy()
-        arm_state.current_wrist_roll = current_angles[WRIST_ROLL_INDEX]
-        arm_state.current_wrist_flex = current_angles[WRIST_FLEX_INDEX]
-        arm_state.origin_wrist_roll_angle = current_angles[WRIST_ROLL_INDEX]
-        arm_state.origin_wrist_flex_angle = current_angles[WRIST_FLEX_INDEX]
+        arm_state.seed_from_pose(
+            position=current_position,
+            quat_wxyz=current_quat,
+            wrist_roll_deg=current_angles[WRIST_ROLL_INDEX],
+            wrist_flex_deg=current_angles[WRIST_FLEX_INDEX],
+        )
 
-    def _set_idle_marker_state(self, arm: str, arm_state: ArmState, current_position: np.ndarray, current_quat: np.ndarray):
+    def _set_idle_marker_state(self, arm: str, arm_state: ArmRuntimeState, current_position: np.ndarray, current_quat: np.ndarray):
         """退出控制时，让 target marker 与当前 tools_link 严格重合。"""
-        arm_state.last_mocap_target_position = current_position.copy()
-        arm_state.last_mocap_target_quaternion = current_quat.copy()
+        arm_state.record_mocap(current_position, current_quat)
         if self.visualizer:
             self.visualizer.update_marker_position(
                 f"{arm}_target", current_position, current_quat
@@ -602,8 +587,8 @@ class ControlLoop:
         if self.robot_interface is None:
             return
 
-        for reset_state in (self.left_arm, self.right_arm):
-            self._clear_arm_target_state(reset_state)
+        for arm_state in self.arm_states.values():
+            self._clear_arm_target_state(arm_state)
 
         ok = self.robot_interface.start_reference_pose_initialization()
         if ok:
@@ -611,7 +596,7 @@ class ControlLoop:
         else:
             logger.warning("📡 X/A long-hold: failed to enter INITIALIZING state")
 
-    def _activate_position_control(self, arm: str, arm_state: ArmState) -> bool:
+    def _activate_position_control(self, arm: str, arm_state: ArmRuntimeState) -> bool:
         """进入 POSITION_CONTROL，并把目标对齐到当前姿态。"""
         bridge_state = getattr(self.robot_interface, "bridge_state", "entering") if self.robot_interface else "entering"
         if bridge_state != "executing":
@@ -632,14 +617,14 @@ class ControlLoop:
         logger.info(f"🔒 {arm.upper()} arm: Position control ACTIVATED (target reset to current position)")
         return True
 
-    def _deactivate_position_control(self, arm: str, arm_state: ArmState):
+    def _deactivate_position_control(self, arm: str, arm_state: ArmRuntimeState):
         """退出 POSITION_CONTROL，并保持 marker 稳定。"""
         current_position, current_quat, _ = self._capture_current_arm_pose(arm)
         self._clear_arm_target_state(arm_state)
         self._set_idle_marker_state(arm, arm_state, current_position, current_quat)
         logger.info(f"🔓 {arm.upper()} arm: Position control DEACTIVATED")
 
-    def _apply_position_goal(self, arm: str, arm_state: ArmState, goal: ControlGoal):
+    def _apply_position_goal(self, arm: str, arm_state: ArmRuntimeState, goal: ControlGoal):
         """把输入层目标更新到 arm_state，不直接做 IK。"""
         if goal.target_position is not None:
             if goal.metadata and goal.metadata.get("relative_position", False):
@@ -688,7 +673,7 @@ class ControlLoop:
             else:
                 arm_state.current_wrist_flex = goal.wrist_flex_deg
 
-    def _build_ik_request_for_arm(self, arm_name: str, arm_state: ArmState):
+    def _build_ik_request_for_arm(self, arm_name: str, arm_state: ArmRuntimeState):
         """
         为单臂收集 IK 请求。
 
@@ -774,8 +759,8 @@ class ControlLoop:
             self.robot_interface.update_arm_angles(
                 "left",
                 left_solution,
-                self.left_arm.current_wrist_flex,
-                self.left_arm.current_wrist_roll,
+                self.arm_states["left"].current_wrist_flex,
+                self.arm_states["left"].current_wrist_roll,
                 left_gripper,
                 wrist_override=left_req["wrist_override"],
             )
@@ -785,8 +770,8 @@ class ControlLoop:
             self.robot_interface.update_arm_angles(
                 "right",
                 right_solution,
-                self.right_arm.current_wrist_flex,
-                self.right_arm.current_wrist_roll,
+                self.arm_states["right"].current_wrist_flex,
+                self.arm_states["right"].current_wrist_roll,
                 right_gripper,
                 wrist_override=right_req["wrist_override"],
             )
@@ -823,21 +808,6 @@ class ControlLoop:
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
     
-    async def _handle_command(self, command):
-        """Handle individual commands."""
-        action = command.get('action', '')
-        logger.info(f"🔌 Processing control command: {action}")
-
-        if action in {'enable_keyboard', 'disable_keyboard', 'web_keypress'}:
-            logger.warning(f"🎮 Keyboard control has been removed, ignoring command: {action}")
-            return
-        elif action == 'robot_connect':
-            logger.info("🔌 robot_connect command ignored (manual engage API removed)")
-        elif action == 'robot_disconnect':
-            logger.info("🔌 robot_disconnect command ignored (manual disengage API removed)")
-        else:
-            logger.warning(f"Unknown command: {action}")
-
     async def _execute_goal(self, goal: ControlGoal):
         """Execute a control goal."""
         arm_state = self._get_arm_state(goal.arm)
@@ -872,241 +842,30 @@ class ControlLoop:
             if self.visualizer:
                 self.visualizer.set_gripper_closed(goal.arm, goal.gripper_closed)
     
-    def _update_robot_safely(self):
-        """Update robot with current control goals (with error handling)."""
-        if not self.robot_interface:
-            return
-        
-        try:
-            self._update_robot()
-        except Exception as e:
-            logger.error(f"Error updating robot: {e}")
-            # Don't shutdown, just continue - robot interface will handle connection issues
-
-    def _simulation_tick_unified(self):
-        """Single-pass simulation tick: marker -> IK -> command -> sim step.
-
-        This mirrors the architecture of mink example scripts more closely by
-        keeping all control actions in one deterministic loop.
-        """
-        if not self.robot_interface or not self.visualizer:
-            return
-
-        # 反馈链路：先把真实关节角同步到 MuJoCo，再以该状态做 Mink IK。
-        if self.config.require_state_feedback or bool(getattr(self.config, "require_joint_state_for_motion", False)):
-            self._sync_mujoco_from_joint_state()
-
-        ik_requests = {
-            "left": None,
-            "right": None,
-        }
-
-        for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
-            ik_requests[arm_name] = self._build_ik_request_for_arm(arm_name, arm_state)
-
-        self._execute_dual_ik_requests(ik_requests)
-
-        # 5) Push commanded targets into simulation + step once.
-        if self.config.require_state_feedback:
-            l_ang = self.robot_interface.get_actual_arm_angles("left")
-            r_ang = self.robot_interface.get_actual_arm_angles("right")
-        else:
-            l_ang = self.robot_interface.get_arm_angles("left")
-            r_ang = self.robot_interface.get_arm_angles("right")
-
-        self.visualizer.update_robot_pose(l_ang, "left")
-        self.visualizer.update_robot_pose(r_ang, "right")
-        self.visualizer.set_gripper_closed("left", self.robot_interface.get_gripper_closed("left"))
-        self.visualizer.set_gripper_closed("right", self.robot_interface.get_gripper_closed("right"))
-        self._mujoco_substep_counter += int(self.sim_substeps)
-        self.visualizer.step_simulation(substeps=self.sim_substeps)
-
-        # 6) Feed simulated feedback in no-feedback mode.
-        if not self.config.require_state_feedback:
-            l_sim = self.visualizer.get_joint_angles_deg("left")
-            r_sim = self.visualizer.get_joint_angles_deg("right")
-            if l_sim is not None:
-                self.robot_interface.set_simulated_arm_angles("left", l_sim)
-            if r_sim is not None:
-                self.robot_interface.set_simulated_arm_angles("right", r_sim)
-
-        # 7) Publish hardware commands (auto-reconnect is handled in send_command()).
-        if self.config.enable_robot:
-            self.robot_interface.send_command()
-    
-    def _update_robot(self):
-        """Update robot with current control goals."""
-        if not self.robot_interface:
-            return
-
-        if not self.config.use_mink:
-            # Keep gripper commands and passthrough robot publishing only.
-            if self.config.enable_robot:
-                self.robot_interface.send_command()
-            return
-
-        ik_requests = {
-            "left": None,
-            "right": None,
-        }
-
-        for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
-            target_name = f"{arm_name}_target"
-            if arm_state.mode != ControlMode.POSITION_CONTROL or arm_state.target_position is None:
-                if self.visualizer:
-                    current_pos = self._get_current_ee_position(arm_name)
-                    current_quat = self._get_current_ee_orientation(arm_name)
-                    self.visualizer.update_marker_position(target_name, current_pos, current_quat)
-                    self.visualizer.hide_marker(f"{arm_name}_goal")
-                    self.visualizer.hide_frame(f"{arm_name}_target_frame")
-                    self.visualizer.hide_frame(f"{arm_name}_goal_frame")
-                    arm_state.last_mocap_target_position = current_pos.copy()
-                    arm_state.last_mocap_target_quaternion = current_quat.copy()
-                continue
-
-            ik_target = arm_state.target_position
-            ik_target_quat = arm_state.target_orientation_quat
-
-            if self.visualizer:
-                self.visualizer.update_marker_position(
-                    target_name, ik_target, arm_state.target_orientation_quat
-                )
-                mocap_pos = self.visualizer.get_mocap_position(target_name)
-                if mocap_pos is not None:
-                    ik_target = mocap_pos
-                    arm_state.last_mocap_target_position = mocap_pos.copy()
-                mocap_quat = self.visualizer.get_mocap_quaternion(target_name)
-                if mocap_quat is not None:
-                    q = np.asarray(mocap_quat, dtype=float)
-                    n = np.linalg.norm(q)
-                    if n > 1e-9:
-                        ik_target_quat = q / n
-
-            current_ee = self._get_current_ee_position(arm_name)
-            ik_target = current_ee + IK_TARGET_SMOOTHING * (ik_target - current_ee)
-
-            ik_requests[arm_name] = {
-                "target": ik_target,
-                "target_quat": ik_target_quat,
-                "wrist_override": True,
-            }
-
-        if ik_requests["left"] is not None or ik_requests["right"] is not None:
-            left_req = ik_requests["left"]
-            right_req = ik_requests["right"]
-
-            left_target = left_req["target"] if left_req is not None else self._get_current_ee_position("left")
-            right_target = right_req["target"] if right_req is not None else self._get_current_ee_position("right")
-            left_target_quat = left_req["target_quat"] if left_req is not None else None
-            right_target_quat = right_req["target_quat"] if right_req is not None else None
-
-            self._mink_solve_counter += 1
-            left_solution, right_solution = self.robot_interface.solve_dual_ik(
-                left_target_position=left_target,
-                right_target_position=right_target,
-                left_target_orientation=left_target_quat,
-                right_target_orientation=right_target_quat,
-            )
-
-            if left_req is not None:
-                left_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
-                self.robot_interface.update_arm_angles(
-                    "left",
-                    left_solution,
-                    self.left_arm.current_wrist_flex,
-                    self.left_arm.current_wrist_roll,
-                    left_gripper,
-                    wrist_override=left_req["wrist_override"],
-                )
-
-            if right_req is not None:
-                right_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
-                self.robot_interface.update_arm_angles(
-                    "right",
-                    right_solution,
-                    self.right_arm.current_wrist_flex,
-                    self.right_arm.current_wrist_roll,
-                    right_gripper,
-                    wrist_override=right_req["wrist_override"],
-                )
-
-        # Send commands to robot hardware (auto-reconnect handled inside send_command()).
-        if self.config.enable_robot:
-            self.robot_interface.send_command()
-
-    def _update_visualization(self):
-        """Update MuJoCo visualization."""
-        if not self.visualizer:
-            return
-        
-        # In no-feedback/simulation mode, drive the visualizer from commanded angles.
-        # Otherwise use hardware feedback angles.
+    def _get_visualizer_joint_angles(self) -> tuple[np.ndarray, np.ndarray]:
+        """统一选择可视化驱动角度来源。"""
         if self.config.require_state_feedback:
             left_angles = self.robot_interface.get_actual_arm_angles("left")
             right_angles = self.robot_interface.get_actual_arm_angles("right")
         else:
             left_angles = self.robot_interface.get_arm_angles("left")
             right_angles = self.robot_interface.get_arm_angles("right")
-        
-        self.visualizer.update_robot_pose(left_angles, 'left')
-        self.visualizer.update_robot_pose(right_angles, 'right')
+        return left_angles, right_angles
+
+    def _update_visualizer_state(self):
+        """统一更新可视化与仿真状态。"""
+        if not self.visualizer or not self.robot_interface:
+            return
+
+        left_angles, right_angles = self._get_visualizer_joint_angles()
+        self.visualizer.update_robot_pose(left_angles, "left")
+        self.visualizer.update_robot_pose(right_angles, "right")
         self.visualizer.set_gripper_closed("left", self.robot_interface.get_gripper_closed("left"))
         self.visualizer.set_gripper_closed("right", self.robot_interface.get_gripper_closed("right"))
-        
-        # Update visualization markers
-        if self.left_arm.mode == ControlMode.POSITION_CONTROL:
-            if self.left_arm.target_position is not None:
-                # Show controller-provided target position (desired EE target)
-                target_pos = self.left_arm.target_position
-                self.visualizer.update_marker_position(
-                    "left_target", target_pos, self.left_arm.target_orientation_quat
-                )
-                self.visualizer.update_coordinate_frame("left_target_frame", target_pos)
-            
-            if self.left_arm.goal_position is not None:
-                # Show goal position
-                self.visualizer.update_marker_position("left_goal", self.left_arm.goal_position)
-                self.visualizer.update_coordinate_frame("left_goal_frame", self.left_arm.goal_position)
-        else:
-            # In idle mode, force target marker to overlap current tools_link.
-            left_actual_pos = self._get_current_ee_position("left")
-            left_actual_quat = self._get_current_ee_orientation("left")
-            self.visualizer.update_marker_position("left_target", left_actual_pos, left_actual_quat)
-            self.left_arm.last_mocap_target_position = left_actual_pos.copy()
-            self.left_arm.last_mocap_target_quaternion = left_actual_quat.copy()
-            self.visualizer.hide_marker("left_goal")
-            self.visualizer.hide_frame("left_target_frame")
-            self.visualizer.hide_frame("left_goal_frame")
-        
-        if self.right_arm.mode == ControlMode.POSITION_CONTROL:
-            if self.right_arm.target_position is not None:
-                # Show controller-provided target position (desired EE target)
-                target_pos = self.right_arm.target_position
-                self.visualizer.update_marker_position(
-                    "right_target", target_pos, self.right_arm.target_orientation_quat
-                )
-                self.visualizer.update_coordinate_frame("right_target_frame", target_pos)
-            
-            if self.right_arm.goal_position is not None:
-                # Show goal position
-                self.visualizer.update_marker_position("right_goal", self.right_arm.goal_position)
-                self.visualizer.update_coordinate_frame("right_goal_frame", self.right_arm.goal_position)
-        else:
-            # In idle mode, force target marker to overlap current tools_link.
-            right_actual_pos = self._get_current_ee_position("right")
-            right_actual_quat = self._get_current_ee_orientation("right")
-            self.visualizer.update_marker_position("right_target", right_actual_pos, right_actual_quat)
-            self.right_arm.last_mocap_target_position = right_actual_pos.copy()
-            self.right_arm.last_mocap_target_quaternion = right_actual_quat.copy()
-            self.visualizer.hide_marker("right_goal")
-            self.visualizer.hide_frame("right_target_frame")
-            self.visualizer.hide_frame("right_goal_frame")
-        
-        # Step simulation once per control tick (same pattern as arm_arm620_dual).
+
         self._mujoco_substep_counter += int(self.sim_substeps)
         self.visualizer.step_simulation(substeps=self.sim_substeps)
 
-        # Feed back simulated joint angles when ROS state feedback is disabled.
         if not self.config.require_state_feedback:
             l_sim = self.visualizer.get_joint_angles_deg("left")
             r_sim = self.visualizer.get_joint_angles_deg("right")
@@ -1114,6 +873,11 @@ class ControlLoop:
                 self.robot_interface.set_simulated_arm_angles("left", l_sim)
             if r_sim is not None:
                 self.robot_interface.set_simulated_arm_angles("right", r_sim)
+
+    def _publish_robot_command(self):
+        """统一处理真实机器人命令下发。"""
+        if self.config.enable_robot and self.robot_interface:
+            self.robot_interface.send_command()
     
     def _periodic_logging(self):
         """Log status information periodically."""
@@ -1149,16 +913,16 @@ class ControlLoop:
             self._mujoco_substep_counter = 0
             
             active_arms = []
-            if self.left_arm.mode == ControlMode.POSITION_CONTROL:
-                active_arms.append("LEFT")
-            if self.right_arm.mode == ControlMode.POSITION_CONTROL:
-                active_arms.append("RIGHT")
+            for arm in ARM_NAMES:
+                if self.arm_states[arm].mode == ControlMode.POSITION_CONTROL:
+                    active_arms.append(arm.upper())
             
             if active_arms and self.robot_interface:
                 left_angles = self.robot_interface.get_arm_angles("left")
                 right_angles = self.robot_interface.get_arm_angles("right")
                 details = []
-                for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
+                for arm_name in ARM_NAMES:
+                    arm_state = self.arm_states[arm_name]
                     if arm_state.mode != ControlMode.POSITION_CONTROL or arm_state.target_position is None:
                         continue
                     actual_pos = self._get_current_ee_position(arm_name)
@@ -1179,8 +943,8 @@ class ControlLoop:
         """Get current control loop status."""
         return {
             "running": self.is_running,
-            "left_arm_mode": self.left_arm.mode.value,
-            "right_arm_mode": self.right_arm.mode.value,
+            "left_arm_mode": self.arm_states["left"].mode.value,
+            "right_arm_mode": self.arm_states["right"].mode.value,
             "robot_connected": self.robot_interface.is_connected if self.robot_interface else False,
             "left_arm_connected": self.robot_interface.get_arm_connection_status("left") if self.robot_interface else False,
             "right_arm_connected": self.robot_interface.get_arm_connection_status("right") if self.robot_interface else False,

@@ -63,6 +63,11 @@ DEFAULT_CONFIG = {
         "use_mink": True,
         "enable_sim": True,
         "enable_gui": True,
+        "teleop_frame": {
+            "translation_euler_xyz_deg": [0.0, 0.0, 180.0],
+            "relative_rotation_axis_map": [],
+            "ee_target_orientation_correction_euler_xyz_deg": [0.0, 0.0, 0.0],
+        },
         "mink": {
             "enabled": True,
             "mujoco_scene": "mink/examples/arm620/scene.xml",
@@ -77,19 +82,10 @@ DEFAULT_CONFIG = {
             "position_error_threshold": 1e-4,
             "orientation_error_threshold": 1e-3,
         },
-        "keyboard": {
-            "enabled": False,
-            "pos_step": 0.01,
-            "angle_step": 5.0,
-            "gripper_step": 10.0
-        },
         "vr": {
             "enabled": True,
             "orientation_reference_mode": "global_calibration",
             "orientation_reference_quat_xyzw": {},
-            # Optional 3x3 axis remap matrix for relative-rotation delta in control loop.
-            # Keep [] to disable and use identity.
-            "relative_rotation_axis_map": []
         }
     },
     "paths": {
@@ -177,10 +173,6 @@ KEYFILE = _config_data["ssl"]["keyfile"]
 VR_TO_ROBOT_SCALE = _config_data["robot"]["vr_to_robot_scale"]
 SEND_INTERVAL = _config_data["robot"]["send_interval"]
 
-POS_STEP = _config_data["control"]["keyboard"]["pos_step"]
-ANGLE_STEP = _config_data["control"]["keyboard"]["angle_step"]
-GRIPPER_STEP = _config_data["control"]["keyboard"]["gripper_step"]
-
 USE_MINK = _config_data["control"].get("use_mink", True)
 MINK_MUJOCO_SCENE = _config_data["control"].get("mink", {}).get("mujoco_scene", "mink/examples/arm620/scene.xml")
 MINK_END_EFFECTOR_SITE = _config_data["control"].get("mink", {}).get("end_effector_site", "tools_link")
@@ -244,11 +236,6 @@ URDF_TO_INTERNAL_NAME_MAP = {
 # --- End Effector Configuration ---
 END_EFFECTOR_LINK_NAME = "Fixed_Jaw_tip"
 
-# --- Input Step Defaults ---
-POS_STEP = 0.01  # meters
-ANGLE_STEP = 5.0 # degrees
-GRIPPER_STEP = 10.0 # degrees
-
 @dataclass
 class TelegripConfig:
     """Main configuration class for the teleoperation system."""
@@ -309,8 +296,9 @@ class TelegripConfig:
     vr_orientation_reference_mode: str = str(
         _config_data.get("control", {}).get("vr", {}).get("orientation_reference_mode", "global_calibration")
     )
-    vr_relative_rotation_axis_map: Optional[List[List[float]]] = None
-    enable_keyboard: bool = False
+    teleop_frame_translation_euler_xyz_deg: Optional[List[float]] = None
+    teleop_frame_relative_rotation_axis_map: Optional[List[List[float]]] = None
+    teleop_frame_ee_target_orientation_correction_euler_xyz_deg: Optional[List[float]] = None
     autoconnect: bool = False
     log_level: str = "warning"
 
@@ -344,21 +332,49 @@ class TelegripConfig:
     gripper_open_angle: float = GRIPPER_OPEN_ANGLE
     gripper_closed_angle: float = GRIPPER_CLOSED_ANGLE
     
-    # Input step defaults
-    pos_step: float = POS_STEP
-    angle_step: float = ANGLE_STEP
-    gripper_step: float = GRIPPER_STEP
-    
     def __post_init__(self):
         if self.gnirehtet_args is None:
             cfg_args = _config_data.get("gnirehtet", {}).get("args", [])
             self.gnirehtet_args = [str(arg) for arg in cfg_args] if isinstance(cfg_args, list) else []
-        if self.vr_relative_rotation_axis_map is None:
-            cfg_map = _config_data.get("control", {}).get("vr", {}).get("relative_rotation_axis_map", [])
-            if isinstance(cfg_map, list):
-                self.vr_relative_rotation_axis_map = cfg_map.copy()
+        teleop_frame_cfg = _config_data.get("control", {}).get("teleop_frame", {})
+        if self.teleop_frame_translation_euler_xyz_deg is None:
+            cfg_translation = teleop_frame_cfg.get("translation_euler_xyz_deg", [0.0, 0.0, 180.0])
+            if isinstance(cfg_translation, list):
+                self.teleop_frame_translation_euler_xyz_deg = cfg_translation[:3]
             else:
-                self.vr_relative_rotation_axis_map = []
+                self.teleop_frame_translation_euler_xyz_deg = [0.0, 0.0, 180.0]
+        if self.teleop_frame_relative_rotation_axis_map is None:
+            # 向后兼容旧配置 control.vr.relative_rotation_axis_map。
+            cfg_map = teleop_frame_cfg.get(
+                "relative_rotation_axis_map",
+                _config_data.get("control", {}).get("vr", {}).get("relative_rotation_axis_map", []),
+            )
+            if isinstance(cfg_map, list):
+                self.teleop_frame_relative_rotation_axis_map = cfg_map.copy()
+            else:
+                self.teleop_frame_relative_rotation_axis_map = []
+        if self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg is None:
+            cfg_correction = teleop_frame_cfg.get(
+                "ee_target_orientation_correction_euler_xyz_deg",
+                [0.0, 0.0, 0.0],
+            )
+            if isinstance(cfg_correction, list):
+                self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg = cfg_correction[:3]
+            else:
+                self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg = [0.0, 0.0, 0.0]
+        self.teleop_frame_translation_euler_xyz_deg = [
+            float(v) for v in (self.teleop_frame_translation_euler_xyz_deg[:3] + [0.0, 0.0, 180.0])[:3]
+        ]
+        self.teleop_frame_relative_rotation_axis_map = (
+            self.teleop_frame_relative_rotation_axis_map
+            if isinstance(self.teleop_frame_relative_rotation_axis_map, list)
+            else []
+        )
+        self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg = [
+            float(v) for v in (
+                self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg[:3] + [0.0, 0.0, 0.0]
+            )[:3]
+        ]
         if self.initial_joint_positions_deg is None:
             cfg_init = _config_data.get("ik", {}).get(
                 "initial_joint_positions_deg",

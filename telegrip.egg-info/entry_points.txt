@@ -1,2 +1,0 @@
-[console_scripts]
-telegrip = telegrip.main:main_cli

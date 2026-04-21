@@ -6,6 +6,69 @@ control:
     enabled: false
     gripper_step: 10.0
     pos_step: 0.01
+  teleop_frame:
+    # 相对平移变化量的坐标映射（单位：度，按 XYZ 欧拉角解释）。
+    #
+    # 记：
+    #   delta_vr     = VR 手柄相对起点的平移变化量
+    #   R_translation = 由 translation_euler_xyz_deg 生成的旋转矩阵
+    #   delta_target = 映射到机器人目标坐标系后的平移变化量
+    #
+    # 则平移映射公式为：
+    #   delta_target = R_translation * delta_vr
+    #
+    # 在位置控制里，最终目标位置按下面方式更新：
+    #   p_target = p_origin + delta_target
+    #
+    # 用途：
+    #   当你发现“手柄平移方向”整体不对时，优先修改这里。
+    #
+    # 例子：
+    #   [0, 0, 180] 等价于绕 Z 轴旋转 180 度，
+    #   对平移变化量表现为：X -> -X, Y -> -Y, Z -> Z
+    translation_euler_xyz_deg: [0.0, 0.0, 180.0]
+
+    # 相对旋转增量的最终轴映射矩阵 U（3x3 正交矩阵）。
+    #
+    # 记：
+    #   R_delta_hand   = 手柄相对参考姿态的旋转增量矩阵
+    #   U              = relative_rotation_axis_map
+    #   R_delta_target = 映射到机器人目标姿态坐标系后的旋转增量
+    #
+    # 则旋转增量映射公式为：
+    #   R_delta_target = U * R_delta_hand * U^T
+    #
+    # 注意：
+    #   1. 这里配置的是“最终总映射矩阵”，不是多段叠加配置。
+    #   2. 如果你想在已有映射基础上继续叠加修正，需要先做矩阵乘法，
+    #      把合成后的结果填到这里。
+    #
+    # 当前这个矩阵表示：
+    #   X -> -X
+    #   Y -> -Z
+    #   Z -> +Y
+    #
+    # 这是你在现有 Y/Z 交换映射基础上，再叠加一次符号修正后的总结果。
+    relative_rotation_axis_map:
+    - [-1, 0, 0]
+    - [0, 0, -1]
+    - [0, 1, 0]
+
+    # 末端目标姿态固定补偿 q_ee_fix（单位：度，按 XYZ 欧拉角解释）。
+    #
+    # 记：
+    #   q_origin         = 进入当前位置控制时的末端初始目标姿态
+    #   q_delta_target   = 由 R_delta_target 转成的四元数
+    #   q_ee_fix         = 由 ee_target_orientation_correction_euler_xyz_deg 转成的固定补偿四元数
+    #   q_target         = 最终送给 target site / marker 的目标姿态
+    #
+    # 则目标姿态合成公式为：
+    #   q_target = q_origin * q_delta_target * q_ee_fix
+    #
+    # 用途：
+    #   当平移映射和旋转增量方向都已经正确，
+    #   但工具头 / 夹爪的“静态朝向”仍然整体偏一个固定角度时，修改这里。
+    ee_target_orientation_correction_euler_xyz_deg: [-90.0, 0.0, 0.0]
   mink:
     # IK 积分步长（单位：秒）。越大单步动作越激进，越小越平滑。
     dt: 0.005
@@ -32,14 +95,6 @@ control:
   vr:
     enabled: true
     orientation_reference_mode: global_calibration # grip_press global_calibration
-    # 可选：相对旋转增量的二次轴映射（3x3 正交矩阵）。
-    # 先留空表示不启用（等价单位阵）。
-    # 调整后: X/Y 方向翻转，保持 Z 映射符合当前需求
-    # X -> +X, Y -> +Z, Z -> +Y
-    relative_rotation_axis_map:
-    - [1, 0, 0]
-    - [0, 0, 1]
-    - [0, 1, 0]
     orientation_reference_quat_xyzw:
       left:
       - 0
