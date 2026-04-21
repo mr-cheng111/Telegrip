@@ -9,7 +9,7 @@ import logging
 import signal
 import sys
 
-from .config import TelegripConfig, NUM_JOINTS, load_config
+from .config import TelegripConfig, load_config
 from .http_api import get_local_ip
 from .runtime import TelegripSystem, create_signal_handler
 
@@ -102,6 +102,12 @@ def create_config_from_args(args) -> TelegripConfig:
     config.ros2_joint_state_topic = str(
         ros2_cfg.get("joint_state_topic", config.ros2_joint_state_topic)
     )
+    config.ros2_left_joint_cmd_topic = str(
+        ros2_cfg.get("left_joint_cmd_topic", config.ros2_left_joint_cmd_topic)
+    )
+    config.ros2_right_joint_cmd_topic = str(
+        ros2_cfg.get("right_joint_cmd_topic", config.ros2_right_joint_cmd_topic)
+    )
     config.ros2_aggregate_joint_cmd_topic = str(
         ros2_cfg.get("aggregate_joint_cmd_topic", config.ros2_aggregate_joint_cmd_topic)
     )
@@ -152,19 +158,7 @@ def create_config_from_args(args) -> TelegripConfig:
     config.gripper_closed_angle = float(gripper_cfg.get("closed_angle", config.gripper_closed_angle))
 
     config.use_reference_poses = bool(ik_cfg.get("use_reference_poses", config.use_reference_poses))
-    cfg_init = ik_cfg.get("initial_joint_positions_deg", config.initial_joint_positions_deg)
-    if isinstance(cfg_init, dict):
-        normalized_init = {}
-        for arm in ("left", "right"):
-            raw = cfg_init.get(arm, [])
-            normalized_init[arm] = [float(v) for v in raw[:NUM_JOINTS]] if isinstance(raw, list) else []
-        config.initial_joint_positions_deg = normalized_init
-    elif isinstance(cfg_init, list):
-        shared = [float(v) for v in cfg_init[:NUM_JOINTS]]
-        config.initial_joint_positions_deg = {"left": shared.copy(), "right": shared.copy()}
-    config.initial_reached_tolerance_deg = float(
-        ik_cfg.get("initial_reached_tolerance_deg", config.initial_reached_tolerance_deg)
-    )
+    config.reference_poses_file = str(ik_cfg.get("reference_poses_file", config.reference_poses_file))
     config.ik_position_error_threshold = float(ik_cfg.get("position_error_threshold", config.ik_position_error_threshold))
     config.ik_hysteresis_threshold = float(ik_cfg.get("hysteresis_threshold", config.ik_hysteresis_threshold))
     config.ik_movement_penalty_weight = float(ik_cfg.get("movement_penalty_weight", config.ik_movement_penalty_weight))

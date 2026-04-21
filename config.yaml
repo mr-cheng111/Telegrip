@@ -31,7 +31,7 @@ control:
   use_mink: true
   vr:
     enabled: true
-    orientation_reference_mode: grip_press # grip_press global_calibration
+    orientation_reference_mode: global_calibration # grip_press global_calibration
     # 可选：相对旋转增量的二次轴映射（3x3 正交矩阵）。
     # 先留空表示不启用（等价单位阵）。
     # 调整后: X/Y 方向翻转，保持 Z 映射符合当前需求
@@ -61,9 +61,24 @@ gripper:
   open_angle: 0.0
 ik:
   hysteresis_threshold: 0.05
+  initial_reached_tolerance_deg: 3.0
+  initial_joint_positions_deg:
+    left:
+    - 90.0
+    - 30.0
+    - 90.0
+    - 90.0
+    - 90.0
+    - 150.0
+    right:
+    - -90.0
+    - -30.0
+    - -90.0
+    - -90.0
+    - -90.0
+    - 30.0
   movement_penalty_weight: 0.01
   position_error_threshold: 0.01
-  reference_poses_file: reference_poses_arm620.json
   use_reference_poses: true
 network:
   host_ip: 0.0.0.0
@@ -75,9 +90,8 @@ robot:
   command_backend: ros2_topic
   require_joint_state_for_motion: true
   ros2:
-    joint_state_topic: /joint_states
-    left_joint_cmd_topic: /left_arm/joint_commands
-    right_joint_cmd_topic: /right_arm/joint_commands
+    joint_state_topic: /joint_states_sim
+    aggregate_joint_cmd_topic: /joint_target
   arm_controller:
     workspace: /home/nvidia/Projects/universal-arm-controller
     module_dir: ""

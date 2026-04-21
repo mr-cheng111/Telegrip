@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
         "command_backend": "ros2_topic",
         "ros2": {
             "joint_state_topic": "/joint_states",
+            "left_joint_cmd_topic": "/left_arm/joint_commands",
+            "right_joint_cmd_topic": "/right_arm/joint_commands",
             "aggregate_joint_cmd_topic": "/joint_target",
         },
         "arm_controller": {
@@ -99,13 +101,9 @@ DEFAULT_CONFIG = {
         "open_angle": 0.0,
         "closed_angle": 45.0
     },
-        "ik": {
+    "ik": {
         "use_reference_poses": True,
-        "initial_joint_positions_deg": {
-            "left": [0.0, 0.0, -90.0, 0.0, -90.0, 0.0],
-            "right": [0.0, 0.0, -90.0, 0.0, -90.0, 0.0],
-        },
-        "initial_reached_tolerance_deg": 3.0,
+        "reference_poses_file": "reference_poses.json",
         "position_error_threshold": 0.001,
         "hysteresis_threshold": 0.01,
         "movement_penalty_weight": 0.01
@@ -201,17 +199,10 @@ GRIPPER_CLOSED_ANGLE = _config_data["gripper"]["closed_angle"]
 
 # IK Configuration
 USE_REFERENCE_POSES = _config_data["ik"]["use_reference_poses"]
-INITIAL_JOINT_POSITIONS_DEG = _config_data["ik"].get(
-    "initial_joint_positions_deg",
-    {
-        "left": [0.0, 0.0, -90.0, 0.0, -90.0, 0.0],
-        "right": [0.0, 0.0, -90.0, 0.0, -90.0, 0.0],
-    },
-)
+REFERENCE_POSES_FILE = _config_data["ik"]["reference_poses_file"]
 IK_POSITION_ERROR_THRESHOLD = _config_data["ik"]["position_error_threshold"]
 IK_HYSTERESIS_THRESHOLD = _config_data["ik"]["hysteresis_threshold"]
 IK_MOVEMENT_PENALTY_WEIGHT = _config_data["ik"]["movement_penalty_weight"]
-IK_INITIAL_REACHED_TOLERANCE_DEG = float(_config_data["ik"].get("initial_reached_tolerance_deg", 3.0))
 
 # --- Joint Configuration ---
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
@@ -297,6 +288,12 @@ class TelegripConfig:
     ros2_joint_state_topic: str = str(
         _config_data["robot"].get("ros2", {}).get("joint_state_topic", "/joint_states")
     )
+    ros2_left_joint_cmd_topic: str = str(
+        _config_data["robot"].get("ros2", {}).get("left_joint_cmd_topic", "/left_arm/joint_commands")
+    )
+    ros2_right_joint_cmd_topic: str = str(
+        _config_data["robot"].get("ros2", {}).get("right_joint_cmd_topic", "/right_arm/joint_commands")
+    )
     ros2_aggregate_joint_cmd_topic: str = str(
         _config_data["robot"].get("ros2", {}).get("aggregate_joint_cmd_topic", "/joint_target")
     )
@@ -334,8 +331,7 @@ class TelegripConfig:
     
     # IK settings
     use_reference_poses: bool = USE_REFERENCE_POSES
-    initial_joint_positions_deg: Optional[dict] = None
-    initial_reached_tolerance_deg: float = IK_INITIAL_REACHED_TOLERANCE_DEG
+    reference_poses_file: str = REFERENCE_POSES_FILE
     ik_position_error_threshold: float = IK_POSITION_ERROR_THRESHOLD
     ik_hysteresis_threshold: float = IK_HYSTERESIS_THRESHOLD
     ik_movement_penalty_weight: float = IK_MOVEMENT_PENALTY_WEIGHT
@@ -359,33 +355,6 @@ class TelegripConfig:
                 self.vr_relative_rotation_axis_map = cfg_map.copy()
             else:
                 self.vr_relative_rotation_axis_map = []
-        if self.initial_joint_positions_deg is None:
-            cfg_init = _config_data.get("ik", {}).get(
-                "initial_joint_positions_deg",
-                {
-                    "left": [0.0, 0.0, -90.0, 0.0, -90.0, 0.0],
-                    "right": [0.0, 0.0, -90.0, 0.0, -90.0, 0.0],
-                },
-            )
-            self.initial_joint_positions_deg = cfg_init
-        if not isinstance(self.initial_joint_positions_deg, dict):
-            shared = (
-                [float(v) for v in self.initial_joint_positions_deg[:NUM_JOINTS]]
-                if isinstance(self.initial_joint_positions_deg, list)
-                else [0.0, 0.0, -90.0, 0.0, -90.0, 0.0]
-            )
-            self.initial_joint_positions_deg = {
-                "left": shared.copy(),
-                "right": shared.copy(),
-            }
-        normalized_init = {}
-        for arm in ("left", "right"):
-            raw = self.initial_joint_positions_deg.get(arm, [])
-            vals = [float(v) for v in raw[:NUM_JOINTS]] if isinstance(raw, list) else []
-            if len(vals) < NUM_JOINTS:
-                vals = (vals + [0.0] * NUM_JOINTS)[:NUM_JOINTS]
-            normalized_init[arm] = vals
-        self.initial_joint_positions_deg = normalized_init
         self.robot_command_backend = str(self.robot_command_backend or "ros2_topic").strip().lower()
         self.require_joint_state_for_motion = bool(self.require_joint_state_for_motion)
         self.arm_controller_left_mapping = str(self.arm_controller_left_mapping or "left_arm").strip()
@@ -393,6 +362,12 @@ class TelegripConfig:
         self.arm_command_interpolation_alpha = float(np.clip(self.arm_command_interpolation_alpha, 0.0, 1.0))
         self.arm_command_max_step_deg = max(0.0, float(self.arm_command_max_step_deg))
         self.ros2_joint_state_topic = str(self.ros2_joint_state_topic or "/joint_states").strip()
+        self.ros2_left_joint_cmd_topic = str(
+            self.ros2_left_joint_cmd_topic or "/left_arm/joint_commands"
+        ).strip()
+        self.ros2_right_joint_cmd_topic = str(
+            self.ros2_right_joint_cmd_topic or "/right_arm/joint_commands"
+        ).strip()
         self.ros2_aggregate_joint_cmd_topic = str(
             self.ros2_aggregate_joint_cmd_topic or "/joint_target"
         ).strip()
@@ -424,6 +399,10 @@ class TelegripConfig:
     def get_absolute_urdf_path(self) -> str:
         """Get absolute path to URDF file."""
         return str(get_absolute_path(self.urdf_path))
+    
+    def get_absolute_reference_poses_path(self) -> str:
+        """Get absolute path to reference poses file."""
+        return str(get_absolute_path(self.reference_poses_file))
     
     def get_absolute_ssl_paths(self) -> tuple:
         """Get absolute paths to SSL certificate files."""

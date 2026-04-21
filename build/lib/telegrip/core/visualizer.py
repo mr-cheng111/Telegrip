@@ -123,7 +123,6 @@ class MuJoCoVisualizer:
     
     def _find_robot_components(self):
         """Find robot bodies, joints, and sites in the model."""
-        resolved_exact_dual_sites = False
         # Prefer exact dual names first, then fallback to dynamic resolution.
         try:
             left_sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left/tools_link")
@@ -131,7 +130,6 @@ class MuJoCoVisualizer:
             if left_sid >= 0 and right_sid >= 0:
                 self.left_ee_site_id = left_sid
                 self.right_ee_site_id = right_sid
-                resolved_exact_dual_sites = True
                 logger.info("Resolved dual end effector sites: left/tools_link, right/tools_link")
         except Exception:
             pass
@@ -144,11 +142,7 @@ class MuJoCoVisualizer:
                 if name and (name == "tools_link" or name.endswith("/tools_link")):
                     site_ids.append(sid)
 
-            # 已经通过精确名字解析到双臂 site 时，不要再根据空间位置重新猜左右。
-            # 旋转/镜像安装后，按 Y 坐标正负排序会把左右手判反。
-            if resolved_exact_dual_sites:
-                pass
-            elif len(site_ids) >= 2:
+            if len(site_ids) >= 2:
                 site_ids = sorted(site_ids, key=lambda i: self.data.site_xpos[i][1], reverse=True)
                 self.left_ee_site_id = site_ids[0]
                 self.right_ee_site_id = site_ids[-1]

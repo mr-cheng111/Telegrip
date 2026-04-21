@@ -185,11 +185,21 @@ class RobotROSNode(Node):
         self.joint_state_topic = str(
             getattr(config, "ros2_joint_state_topic", "/joint_states") or "/joint_states"
         )
+        self.left_joint_cmd_topic = str(
+            getattr(config, "ros2_left_joint_cmd_topic", "/left_arm/joint_commands")
+            or "/left_arm/joint_commands"
+        )
+        self.right_joint_cmd_topic = str(
+            getattr(config, "ros2_right_joint_cmd_topic", "/right_arm/joint_commands")
+            or "/right_arm/joint_commands"
+        )
         self.aggregate_joint_cmd_topic = str(
             getattr(config, "ros2_aggregate_joint_cmd_topic", "/joint_target")
             or "/joint_target"
         )
 
+        self.left_cmd_pub = self.create_publisher(JointState, self.left_joint_cmd_topic, 10)
+        self.right_cmd_pub = self.create_publisher(JointState, self.right_joint_cmd_topic, 10)
         self.aggregate_cmd_pub = self.create_publisher(JointState, self.aggregate_joint_cmd_topic, 10)
 
         # 订阅聚合 /joint_states，并按关节名解析左右臂反馈。
@@ -212,6 +222,8 @@ class RobotROSNode(Node):
         logger.info(
             "ROS2 robot interface node initialized: "
             f"joint_state={self.joint_state_topic}, "
+            f"left_cmd={self.left_joint_cmd_topic}, "
+            f"right_cmd={self.right_joint_cmd_topic}, "
             f"aggregate_cmd={self.aggregate_joint_cmd_topic}"
         )
 
@@ -299,6 +311,23 @@ class RobotROSNode(Node):
         self._update_arm_state_from_msg("left", msg)
         self._update_arm_state_from_msg("right", msg)
     
+    def publish_command(self, arm: str, angles: np.ndarray):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = JOINT_NAMES
+        # ROS2 sequence<double> is strict: it requires plain Python float values.
+        # Also guard against NaN/Inf coming from transient IK/solver states.
+        arr = np.asarray(angles, dtype=np.float64).reshape(-1)
+        if arr.size < NUM_JOINTS:
+            arr = np.pad(arr, (0, NUM_JOINTS - arr.size), mode='constant')
+        arr = np.nan_to_num(arr[:NUM_JOINTS], nan=0.0, posinf=0.0, neginf=0.0)
+        msg.position = [float(v) for v in arr]
+        
+        if arm == "left":
+            self.left_cmd_pub.publish(msg)
+        elif arm == "right":
+            self.right_cmd_pub.publish(msg)
+
     def _gripper_angle_deg_to_main_norm(self, angle_deg: float) -> float:
         """
         将 telegrip 内部夹爪角度映射为 mujoco_env/main.py 使用的 0~1 开合量。
@@ -315,37 +344,7 @@ class RobotROSNode(Node):
         normalized = 1.0 - (float(angle_deg) - open_angle) / denom
         return float(np.clip(normalized, 0.0, 1.0))
 
-    def _gripper_closed_to_main_norm(self, closed: bool) -> float:
-        """将 telegrip 的夹爪开闭状态映射为 main.py 的 0~1 开合量。"""
-        return 0.0 if bool(closed) else 1.0
-
-    @staticmethod
-    def _model_deg_to_main_command_deg(angles_deg: np.ndarray) -> np.ndarray:
-        """
-        将 telegrip/Mink 模型角度映射为 mujoco_env/main.py 订阅侧的命令角度。
-
-        目前 main.py 在收到 /joint_target 后会执行：
-            q_actual = [q1, q2, -q3, -q4, q5, -q6]
-
-        因此为了让 main.py 最终落到 telegrip 期望的模型角 q_model，需要先发送其逆映射：
-            q_cmd = [q1, q2, -q3, -q4, q5, -q6]
-
-        这里这个映射与 main.py 当前 remap 恰好同形，因为每个取反轴满足 inv(-x) = -x。
-        """
-        arr = np.asarray(angles_deg, dtype=np.float64).reshape(-1).copy()
-        if arr.size >= NUM_JOINTS:
-            arr[2] = -arr[2]
-            arr[3] = -arr[3]
-            arr[5] = -arr[5]
-        return arr
-
-    def publish_mainpy_dual_command(
-        self,
-        left_angles_deg: np.ndarray,
-        right_angles_deg: np.ndarray,
-        left_gripper_norm: Optional[float] = None,
-        right_gripper_norm: Optional[float] = None,
-    ):
+    def publish_mainpy_dual_command(self, left_angles_deg: np.ndarray, right_angles_deg: np.ndarray):
         """
         发布给 mujoco_env/main.py 的单话题双臂 14 维控制命令。
 
@@ -355,8 +354,8 @@ class RobotROSNode(Node):
             - 6 个机械臂关节使用弧度
             - 夹爪使用 0~1 归一化量，1=open, 0=close
         """
-        left = self._model_deg_to_main_command_deg(left_angles_deg)
-        right = self._model_deg_to_main_command_deg(right_angles_deg)
+        left = np.asarray(left_angles_deg, dtype=np.float64).reshape(-1)
+        right = np.asarray(right_angles_deg, dtype=np.float64).reshape(-1)
         if left.size < NUM_JOINTS:
             left = np.pad(left, (0, NUM_JOINTS - left.size), mode="constant")
         if right.size < NUM_JOINTS:
@@ -371,20 +370,11 @@ class RobotROSNode(Node):
             "left_joint1", "left_joint2", "left_joint3", "left_joint4", "left_joint5", "left_joint6", "left_gripper",
             "right_joint1", "right_joint2", "right_joint3", "right_joint4", "right_joint5", "right_joint6", "right_gripper",
         ]
-        if left_gripper_norm is None:
-            left_gripper_norm = self._gripper_closed_to_main_norm(
-                self.get_gripper_closed("left")
-            )
-        if right_gripper_norm is None:
-            right_gripper_norm = self._gripper_closed_to_main_norm(
-                self.get_gripper_closed("right")
-            )
-
         msg.position = [
             *[float(v) for v in np.deg2rad(left)],
-            float(np.clip(left_gripper_norm, 0.0, 1.0)),
+            float(self._gripper_angle_deg_to_main_norm(left[5])),
             *[float(v) for v in np.deg2rad(right)],
-            float(np.clip(right_gripper_norm, 0.0, 1.0)),
+            float(self._gripper_angle_deg_to_main_norm(right[5])),
         ]
         self.aggregate_cmd_pub.publish(msg)
     
@@ -429,8 +419,6 @@ class RobotInterface:
         self._joint_state_gate_ready = False
         self._last_joint_state_gate_warn_time = 0.0
         self._joint_state_gate_warn_interval_s = 1.0
-        self._last_initializing_warn_time = 0.0
-        self._initializing_warn_interval_s = 1.0
         
         self.left_arm_connected = False
         self.right_arm_connected = False
@@ -464,12 +452,6 @@ class RobotInterface:
         self.gripper_closed_state = {'left': False, 'right': False}
         
         self.last_send_time = 0
-        self.bridge_state = "entering"
-        self._reference_left_deg = None
-        self._reference_right_deg = None
-        self._init_reached_tolerance_deg = float(
-            getattr(config, "initial_reached_tolerance_deg", 3.0)
-        )
         
         self.left_arm_errors = 0
         self.right_arm_errors = 0
@@ -491,7 +473,6 @@ class RobotInterface:
 
         try:
             self._joint_state_gate_ready = False
-            self.bridge_state = "entering"
             # Cleanup stale resources from previous failed sessions.
             if self.streaming_client is not None:
                 try:
@@ -614,61 +595,6 @@ class RobotInterface:
         else:
             logger.warning("⚠️ Robot backend reconnect failed; will retry automatically")
         return ok
-
-    def _load_reference_pose_deg(self) -> tuple[np.ndarray, np.ndarray]:
-        """从 config.yaml 读取唯一初始姿态（角度制），左右臂共用同一组 6 关节角。"""
-        init_cfg = getattr(self.config, "initial_joint_positions_deg", {})
-        if not isinstance(init_cfg, dict):
-            raise ValueError("ik.initial_joint_positions_deg 必须为包含 left/right 的字典配置")
-
-        left_deg = np.asarray(init_cfg.get("left", []), dtype=np.float64).reshape(-1)
-        right_deg = np.asarray(init_cfg.get("right", []), dtype=np.float64).reshape(-1)
-        if left_deg.size < NUM_JOINTS or right_deg.size < NUM_JOINTS:
-            raise ValueError(
-                f"ik.initial_joint_positions_deg.left/right 都必须提供 {NUM_JOINTS} 个关节角，"
-                f"当前 left={left_deg.size}, right={right_deg.size}"
-            )
-
-        left_deg = np.nan_to_num(left_deg[:NUM_JOINTS], nan=0.0, posinf=0.0, neginf=0.0)
-        right_deg = np.nan_to_num(right_deg[:NUM_JOINTS], nan=0.0, posinf=0.0, neginf=0.0)
-        return left_deg.copy(), right_deg.copy()
-
-    def start_reference_pose_initialization(self) -> bool:
-        """进入初始化状态，并开始周期发送参考姿态。"""
-        try:
-            left_deg, right_deg = self._load_reference_pose_deg()
-            self._reference_left_deg = left_deg
-            self._reference_right_deg = right_deg
-            self.left_arm_angles = left_deg.copy()
-            self.right_arm_angles = right_deg.copy()
-            self.bridge_state = "initializing"
-            self.last_send_time = 0.0
-            logger.info(
-                "Bridge state -> INITIALIZING, reference pose set: "
-                f"left={np.round(left_deg, 2)}, right={np.round(right_deg, 2)}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to enter initialization state: {e}")
-            return False
-
-    def _initialization_target_reached(self) -> bool:
-        """根据 /joint_states 反馈判断是否到达初始化目标姿态。"""
-        if self._reference_left_deg is None or self._reference_right_deg is None:
-            return False
-        left_actual = self.get_actual_arm_angles("left")
-        right_actual = self.get_actual_arm_angles("right")
-        left_ok = np.allclose(
-            left_actual[:NUM_JOINTS],
-            self._reference_left_deg[:NUM_JOINTS],
-            atol=self._init_reached_tolerance_deg,
-        )
-        right_ok = np.allclose(
-            right_actual[:NUM_JOINTS],
-            self._reference_right_deg[:NUM_JOINTS],
-            atol=self._init_reached_tolerance_deg,
-        )
-        return bool(left_ok and right_ok)
     
     def _update_connection_status(self):
         if not self.require_state_feedback:
@@ -681,6 +607,11 @@ class RobotInterface:
             self.ros_node.check_connections()
             self.left_arm_connected = self.ros_node.left_arm_connected
             self.right_arm_connected = self.ros_node.right_arm_connected
+
+            if self.left_arm_connected:
+                self.left_arm_angles = self.ros_node.left_arm_angles.copy()
+            if self.right_arm_connected:
+                self.right_arm_angles = self.ros_node.right_arm_angles.copy()
 
     def _check_joint_state_motion_gate(self, spin_once: bool = True) -> Tuple[bool, bool]:
         """Return (ready, just_opened) for motion gating by /joint_states availability."""
@@ -1096,9 +1027,6 @@ class RobotInterface:
             if not self.is_connected or self.streaming_client is None:
                 return False
 
-        if self.bridge_state == "entering":
-            return True
-
         gate_ready, gate_just_opened = self._check_joint_state_motion_gate(spin_once=True)
         if not gate_ready:
             now = time.time()
@@ -1107,32 +1035,8 @@ class RobotInterface:
                 self._last_joint_state_gate_warn_time = now
             return False
         if gate_just_opened:
-            # 跳过一帧，确保首次用反馈值回填后的目标状态稳定。
+            # Skip one frame to ensure seeded command state is stable.
             return False
-
-        if self.bridge_state == "initializing" and self._initialization_target_reached():
-            # 初始化完成后，默认继续保持“初始姿态命令”为当前目标。
-            # 后续只有当 Mink 产生新的关节解时，才会覆盖 self.left/right_arm_angles。
-            self.left_arm_angles = np.asarray(self._reference_left_deg, dtype=np.float64).reshape(-1)[:NUM_JOINTS].copy()
-            self.right_arm_angles = np.asarray(self._reference_right_deg, dtype=np.float64).reshape(-1)[:NUM_JOINTS].copy()
-            self.left_sim_angles = self.left_arm_angles.copy()
-            self.right_sim_angles = self.right_arm_angles.copy()
-            self.bridge_state = "executing"
-            logger.info(
-                "Bridge state -> EXECUTING (reference pose reached, holding initialization command until Mink updates it)"
-            )
-        elif self.bridge_state == "initializing":
-            now = time.time()
-            if now - self._last_initializing_warn_time >= self._initializing_warn_interval_s:
-                left_actual = self.get_actual_arm_angles("left")
-                right_actual = self.get_actual_arm_angles("right")
-                left_err = np.max(np.abs(left_actual[:NUM_JOINTS] - self._reference_left_deg[:NUM_JOINTS]))
-                right_err = np.max(np.abs(right_actual[:NUM_JOINTS] - self._reference_right_deg[:NUM_JOINTS]))
-                logger.info(
-                    "Bridge still INITIALIZING: reference pose not reached yet | "
-                    f"LEFT_max_err={left_err:.2f}deg RIGHT_max_err={right_err:.2f}deg"
-                )
-                self._last_initializing_warn_time = now
         
         current_time = time.time()
         if current_time - self.last_send_time < self.config.send_interval:
@@ -1169,40 +1073,37 @@ class RobotInterface:
                     self.left_arm_connected = False
                     self.right_arm_connected = False
             else:
-                # ROS2 模式下，telegrip 现在只保留与 mujoco_env/main.py 对齐的聚合命令链路：
-                #   /joint_states_sim -> telegrip -> /joint_target
-                # ENTERING: 不发命令
-                # INITIALIZING: 周期发送参考姿态
-                # EXECUTING: 周期发送当前目标角
-                if self.ros_node is None:
-                    success = False
-                else:
+                if self.ros_node and (self.left_arm_connected or not self.require_state_feedback):
                     try:
-                        if self.bridge_state == "initializing":
-                            left_cmd = np.asarray(self._reference_left_deg, dtype=np.float64).reshape(-1)[:NUM_JOINTS]
-                            right_cmd = np.asarray(self._reference_right_deg, dtype=np.float64).reshape(-1)[:NUM_JOINTS]
-                        else:
-                            left_cmd = np.asarray(self.left_arm_angles, dtype=np.float64).reshape(-1)[:NUM_JOINTS]
-                            right_cmd = np.asarray(self.right_arm_angles, dtype=np.float64).reshape(-1)[:NUM_JOINTS]
-                        left_gripper = float(
-                            self.ros_node._gripper_closed_to_main_norm(
-                                self.get_gripper_closed("left")
-                            )
-                        )
-                        right_gripper = float(
-                            self.ros_node._gripper_closed_to_main_norm(
-                                self.get_gripper_closed("right")
-                            )
-                        )
+                        self.ros_node.publish_command("left", self.left_arm_angles)
+                        self.ros_node.left_arm_angles = self.left_arm_angles.copy()
+                    except Exception as e:
+                        logger.error(f"Error sending left arm command: {e}")
+                        self.left_arm_errors += 1
+                        if self.left_arm_errors > self.max_arm_errors:
+                            self.left_arm_connected = False
+                        success = False
 
+                if self.ros_node and (self.right_arm_connected or not self.require_state_feedback):
+                    try:
+                        self.ros_node.publish_command("right", self.right_arm_angles)
+                        self.ros_node.right_arm_angles = self.right_arm_angles.copy()
+                    except Exception as e:
+                        logger.error(f"Error sending right arm command: {e}")
+                        self.right_arm_errors += 1
+                        if self.right_arm_errors > self.max_arm_errors:
+                            self.right_arm_connected = False
+                        success = False
+
+                # 额外发布一份与 mujoco_env/main.py 对齐的双臂聚合命令。
+                if self.ros_node is not None:
+                    try:
                         self.ros_node.publish_mainpy_dual_command(
-                            left_cmd,
-                            right_cmd,
-                            left_gripper_norm=left_gripper,
-                            right_gripper_norm=right_gripper,
+                            self.left_arm_angles,
+                            self.right_arm_angles,
                         )
                     except Exception as e:
-                        logger.error(f"Error sending aggregate /joint_target command: {e}")
+                        logger.error(f"Error sending aggregate main.py command: {e}")
                         success = False
 
             self.last_send_time = current_time
@@ -1233,6 +1134,20 @@ class RobotInterface:
     def get_gripper_closed(self, arm: str) -> bool:
         """Get desired gripper state for one arm."""
         return bool(self.gripper_closed_state.get(arm, False))
+
+    def publish_mainpy_dual_command_now(self) -> bool:
+        """立即发布一次对齐 mujoco_env/main.py 的 /joint_target 聚合命令。"""
+        if self.ros_node is None:
+            return False
+        try:
+            self.ros_node.publish_mainpy_dual_command(
+                self.left_arm_angles,
+                self.right_arm_angles,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to publish aggregate /joint_target immediately: {e}")
+            return False
     
     def get_arm_angles(self, arm: str) -> np.ndarray:
         """Get current joint angles."""

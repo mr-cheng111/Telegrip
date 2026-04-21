@@ -7,16 +7,14 @@ These poses will be used as additional reference points for IK solving to preven
 
 import os
 import sys
-import json
 import time
 import numpy as np
 import logging
-from pathlib import Path
 
 # Add the telegrip package to the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from telegrip.config import TelegripConfig, REFERENCE_POSES_FILE, NUM_JOINTS
+from telegrip.config import TelegripConfig, NUM_JOINTS, get_config_data, update_config_data
 from telegrip.core.robot_interface import RobotInterface
 
 # Setup logging
@@ -29,10 +27,7 @@ class PoseRecorder:
     def __init__(self):
         self.config = TelegripConfig()
         self.robot_interface = RobotInterface(self.config)
-        self.reference_poses = {
-            'left': [],
-            'right': []
-        }
+        self.reference_poses = {'left': [], 'right': []}
 
     def connect_robot(self) -> bool:
         """Connect to the robot."""
@@ -127,26 +122,36 @@ class PoseRecorder:
         result = self.record_arm_poses('right')
 
     def save_poses(self):
-        """Save recorded poses to file."""
+        """将记录到的第一组姿态写回 config.yaml 的唯一初始角配置。"""
         total_poses = len(self.reference_poses['left']) + len(self.reference_poses['right'])
         if total_poses == 0:
             print("❌ No poses recorded. Nothing to save.")
             return False
 
-        # Get the configured file path (absolute)
-        filename = Path(self.config.get_absolute_reference_poses_path())
-
-        # Create parent directory if it doesn't exist
-        filename.parent.mkdir(parents=True, exist_ok=True)
+        left_pose = self.reference_poses["left"][0][:NUM_JOINTS] if self.reference_poses["left"] else None
+        right_pose = self.reference_poses["right"][0][:NUM_JOINTS] if self.reference_poses["right"] else None
+        if left_pose is None and right_pose is None:
+            print("❌ 没有可写入的初始姿态。")
+            return False
+        if left_pose is None:
+            left_pose = right_pose
+        if right_pose is None:
+            right_pose = left_pose
 
         try:
-            with open(filename, 'w') as f:
-                json.dump(self.reference_poses, f, indent=2)
+            cfg = get_config_data()
+            cfg.setdefault("ik", {})
+            cfg["ik"]["initial_joint_positions_deg"] = {
+                "left": [float(v) for v in left_pose],
+                "right": [float(v) for v in right_pose],
+            }
+            update_config_data(cfg)
 
-            print(f"\n✅ Saved reference poses to {filename}")
-            print(f"   Left arm:  {len(self.reference_poses['left'])} poses")
-            print(f"   Right arm: {len(self.reference_poses['right'])} poses")
-            print("\nThese poses will now be used by the IK solver.")
+            print("\n✅ 已将唯一初始角写入 telegrip/config.yaml")
+            print(f"   LEFT 初始角(度): {[round(float(v), 3) for v in left_pose]}")
+            print(f"   RIGHT 初始角(度): {[round(float(v), 3) for v in right_pose]}")
+            print(f"   Left arm recorded poses:  {len(self.reference_poses['left'])}")
+            print(f"   Right arm recorded poses: {len(self.reference_poses['right'])}")
             return True
 
         except Exception as e:

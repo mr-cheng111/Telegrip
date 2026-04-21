@@ -14,7 +14,6 @@ from pathlib import Path
 
 from .config import TelegripConfig, NUM_JOINTS, WRIST_FLEX_INDEX, WRIST_ROLL_INDEX, GRIPPER_INDEX
 from .core.robot_interface import RobotInterface
-from .core.teleop_frame_mapper import TeleopFrameMapper
 # MuJoCoVisualizer will be imported on demand
 from .inputs.base import ControlGoal, ControlMode
 # Optional input handlers are imported on demand to avoid circular imports
@@ -44,6 +43,10 @@ class ArmState:
         self.current_wrist_flex = 0.0
         self.last_mocap_target_position = None
         self.last_mocap_target_quaternion = None
+        # Fixed offset for absolute-controller orientation mapping.
+        self.controller_to_target_offset_quat = None
+        # Global orientation reference captured at system initialization.
+        self.initial_target_orientation_quat = None
         
     def reset(self):
         """Reset arm state to idle."""
@@ -57,6 +60,7 @@ class ArmState:
         self.origin_wrist_flex_angle = 0.0
         self.last_mocap_target_position = None
         self.last_mocap_target_quaternion = None
+        self.controller_to_target_offset_quat = None
 
 
 class ControlLoop:
@@ -92,16 +96,26 @@ class ControlLoop:
         self._process_debug_logged = False
         
         self.is_running = False
-        # 所有 teleop 相关的平移/姿态补偿统一收拢到 TeleopFrameMapper。
-        relative_rotation_post_axis_map = TeleopFrameMapper.parse_axis_remap_matrix(
+        # VR relative translation -> base_link translation remap.
+        # +X(right) -> -Y, +/-Y(front/back) -> +/-X, Z unchanged.
+        self._vr_delta_to_base_quat = self._quat_from_euler_xyz_deg(0.0, 0.0, -90.0)
+        # Controller-delta -> target-delta orientation frame mapping.
+        # The VR-side frame correction has been applied before transmission, so
+        # this mapping stays identity in control loop.
+        self._controller_delta_to_target_axis_map = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=float,
+        )
+        # Optional extra axis remap after relative-rotation delta conversion.
+        # User-configurable via control.vr.relative_rotation_axis_map (3x3).
+        self._relative_rotation_post_axis_map = self._parse_axis_remap_matrix(
             getattr(self.config, "vr_relative_rotation_axis_map", [])
         )
-        if not np.allclose(relative_rotation_post_axis_map, np.eye(3), atol=1e-9):
+        if not np.allclose(self._relative_rotation_post_axis_map, np.eye(3), atol=1e-9):
             logger.info(
                 "Using vr.relative_rotation_axis_map:\n"
-                f"{relative_rotation_post_axis_map}"
+                f"{self._relative_rotation_post_axis_map}"
             )
-        self.frame_mapper = TeleopFrameMapper.from_telegrip_config(self.config)
         # Guard to ensure startup joint_state->MuJoCo alignment runs only once.
         self._startup_joint_state_initialized = False
 
@@ -115,6 +129,34 @@ class ControlLoop:
         if not np.all(np.isfinite(arr)):
             return None
         return arr.copy()
+
+    @staticmethod
+    def _parse_axis_remap_matrix(raw_matrix) -> np.ndarray:
+        """Parse optional 3x3 axis remap matrix; fallback to identity on invalid input."""
+        identity = np.eye(3, dtype=float)
+        if raw_matrix is None:
+            return identity
+        if isinstance(raw_matrix, list) and len(raw_matrix) == 0:
+            return identity
+        try:
+            mat = np.asarray(raw_matrix, dtype=float)
+        except Exception:
+            logger.warning("Invalid vr.relative_rotation_axis_map type; using identity")
+            return identity
+        if mat.shape != (3, 3) or not np.all(np.isfinite(mat)):
+            logger.warning("vr.relative_rotation_axis_map must be a finite 3x3 matrix; using identity")
+            return identity
+
+        # Similarity transform S*R*S^T assumes orthonormal axis map.
+        ortho_err = float(np.max(np.abs(mat @ mat.T - identity)))
+        det = float(np.linalg.det(mat))
+        if ortho_err > 1e-3 or abs(abs(det) - 1.0) > 1e-3:
+            logger.warning(
+                "vr.relative_rotation_axis_map is not an orthonormal axis map "
+                f"(ortho_err={ortho_err:.3e}, det={det:.6f}); using identity"
+            )
+            return identity
+        return mat
 
     def _collect_startup_joint_state_pose_deg(self, timeout_s: float = 3.0) -> Optional[Dict[str, np.ndarray]]:
         """Fetch one startup joint_state snapshot and convert to degree pose."""
@@ -164,6 +206,7 @@ class ControlLoop:
         if self.robot_interface.ros_node is not None:
             self.robot_interface.ros_node.left_arm_angles = l.copy()
             self.robot_interface.ros_node.right_arm_angles = r.copy()
+
     
     def setup(self) -> bool:
         """Setup robot interface and visualizer."""
@@ -433,10 +476,12 @@ class ControlLoop:
             self.left_arm.goal_position = left_pos.copy()
             self.left_arm.target_orientation_quat = self._get_current_ee_orientation("left")
             self.left_arm.origin_target_orientation_quat = self.left_arm.target_orientation_quat.copy()
+            self.left_arm.initial_target_orientation_quat = self.left_arm.target_orientation_quat.copy()
             self.right_arm.target_position = right_pos.copy()
             self.right_arm.goal_position = right_pos.copy()
             self.right_arm.target_orientation_quat = self._get_current_ee_orientation("right")
             self.right_arm.origin_target_orientation_quat = self.right_arm.target_orientation_quat.copy()
+            self.right_arm.initial_target_orientation_quat = self.right_arm.target_orientation_quat.copy()
             
             # Get current wrist roll angles
             left_angles = self.robot_interface.get_arm_angles("left")
@@ -525,8 +570,98 @@ class ControlLoop:
         return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
 
     @staticmethod
+    def _quat_multiply_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        """Quaternion multiply in [w, x, y, z] convention: q = q1 ⊗ q2."""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        ], dtype=float)
+
+    @staticmethod
+    def _quat_from_rotation_matrix_wxyz(R: np.ndarray) -> np.ndarray:
+        """Convert 3x3 rotation matrix to quaternion [w, x, y, z]."""
+        m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+        m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+        m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+        tr = m00 + m11 + m22
+        if tr > 0.0:
+            s = np.sqrt(tr + 1.0) * 2.0
+            w = 0.25 * s
+            x = (m21 - m12) / s
+            y = (m02 - m20) / s
+            z = (m10 - m01) / s
+        elif (m00 > m11) and (m00 > m22):
+            s = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+            w = (m21 - m12) / s
+            x = 0.25 * s
+            y = (m01 + m10) / s
+            z = (m02 + m20) / s
+        elif m11 > m22:
+            s = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
+            w = (m02 - m20) / s
+            x = (m01 + m10) / s
+            y = 0.25 * s
+            z = (m12 + m21) / s
+        else:
+            s = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
+            w = (m10 - m01) / s
+            x = (m02 + m20) / s
+            y = (m12 + m21) / s
+            z = 0.25 * s
+        return ControlLoop._quat_normalize_wxyz(np.array([w, x, y, z], dtype=float))
+
+    @staticmethod
+    def _quat_to_rotation_matrix_wxyz(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
+        qn = ControlLoop._quat_normalize_wxyz(q)
+        w, x, y, z = qn
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        return np.array(
+            [
+                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _quat_from_euler_xyz_deg(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+        """Build XYZ-order rotation matrix from Euler angles (deg), then convert to [w,x,y,z]."""
+        rx = np.deg2rad(rx_deg)
+        ry = np.deg2rad(ry_deg)
+        rz = np.deg2rad(rz_deg)
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        cz, sz = np.cos(rz), np.sin(rz)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=float)
+        Ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=float)
+        Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+        R = Rz @ Ry @ Rx
+        return ControlLoop._quat_from_rotation_matrix_wxyz(R)
+
+    @staticmethod
+    def _quat_inverse_wxyz(q: np.ndarray) -> np.ndarray:
+        """Quaternion inverse in [w, x, y, z] convention."""
+        w, x, y, z = q
+        n2 = w*w + x*x + y*y + z*z
+        if n2 <= 1e-12:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        return np.array([w, -x, -y, -z], dtype=float) / n2
+
+    @staticmethod
     def _quat_normalize_wxyz(q: np.ndarray) -> np.ndarray:
-        return TeleopFrameMapper.normalize_wxyz(q)
+        q = np.asarray(q, dtype=float).reshape(-1)[:4]
+        n = np.linalg.norm(q)
+        if n <= 1e-12:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        return q / n
 
     @staticmethod
     def _quat_angle_error_deg_wxyz(q_ref: np.ndarray, q_meas: np.ndarray) -> float:
@@ -542,275 +677,15 @@ class ControlLoop:
         dot = float(np.clip(abs(np.dot(q_ref, q_meas)), 0.0, 1.0))
         return float(np.degrees(2.0 * np.arccos(dot)))
 
-    def _get_arm_state(self, arm: str) -> ArmState:
-        return self.left_arm if arm == "left" else self.right_arm
-
-    def _clear_arm_target_state(self, arm_state: ArmState):
-        """清空单臂当前位置控制相关状态。"""
-        arm_state.mode = ControlMode.IDLE
-        arm_state.target_position = None
-        arm_state.target_orientation_quat = None
-        arm_state.origin_target_orientation_quat = None
-        arm_state.goal_position = None
-        arm_state.origin_position = None
-        arm_state.origin_wrist_roll_angle = 0.0
-        arm_state.origin_wrist_flex_angle = 0.0
-
-    def _capture_current_arm_pose(self, arm: str):
-        """抓取当前末端位姿与关节角，作为状态切换的统一输入。"""
-        current_position = self._get_current_ee_position(arm)
-        current_quat = self._get_current_ee_orientation(arm)
-        current_angles = self.robot_interface.get_arm_angles(arm) if self.robot_interface else None
-        return current_position, current_quat, current_angles
-
-    def _seed_arm_target_from_current_pose(self, arm: str, arm_state: ArmState):
-        """
-        用当前机械臂姿态重置控制目标。
-
-        这样 grip 激活或 reset 时，新的目标满足：
-        q_target = q_current
-        p_target = p_current
-        可避免第一帧跳变。
-        """
-        if not self.robot_interface:
-            return
-
-        current_position, current_quat, current_angles = self._capture_current_arm_pose(arm)
-        arm_state.target_position = current_position.copy()
-        arm_state.goal_position = current_position.copy()
-        arm_state.target_orientation_quat = current_quat.copy()
-        arm_state.origin_target_orientation_quat = current_quat.copy()
-        arm_state.origin_position = current_position.copy()
-        arm_state.current_wrist_roll = current_angles[WRIST_ROLL_INDEX]
-        arm_state.current_wrist_flex = current_angles[WRIST_FLEX_INDEX]
-        arm_state.origin_wrist_roll_angle = current_angles[WRIST_ROLL_INDEX]
-        arm_state.origin_wrist_flex_angle = current_angles[WRIST_FLEX_INDEX]
-
-    def _set_idle_marker_state(self, arm: str, arm_state: ArmState, current_position: np.ndarray, current_quat: np.ndarray):
-        """退出控制时，让 target marker 与当前 tools_link 严格重合。"""
-        arm_state.last_mocap_target_position = current_position.copy()
-        arm_state.last_mocap_target_quaternion = current_quat.copy()
-        if self.visualizer:
-            self.visualizer.update_marker_position(
-                f"{arm}_target", current_position, current_quat
-            )
-            self.visualizer.hide_marker(f"{arm}_goal")
-            self.visualizer.hide_frame(f"{arm}_goal_frame")
-
-    def _enter_reference_initialization(self):
-        """进入初始化状态前，清空双臂当前位置控制目标。"""
-        if self.robot_interface is None:
-            return
-
-        for reset_state in (self.left_arm, self.right_arm):
-            self._clear_arm_target_state(reset_state)
-
-        ok = self.robot_interface.start_reference_pose_initialization()
-        if ok:
-            logger.info("📡 X/A long-hold: bridge entered INITIALIZING state")
-        else:
-            logger.warning("📡 X/A long-hold: failed to enter INITIALIZING state")
-
-    def _activate_position_control(self, arm: str, arm_state: ArmState) -> bool:
-        """进入 POSITION_CONTROL，并把目标对齐到当前姿态。"""
-        bridge_state = getattr(self.robot_interface, "bridge_state", "entering") if self.robot_interface else "entering"
-        if bridge_state != "executing":
-            logger.warning(
-                f"⏸ {arm.upper()} arm position-control request ignored: "
-                f"bridge state is {bridge_state}, waiting for EXECUTING"
-            )
-            return False
-        if self.robot_interface and not self.robot_interface.is_motion_gate_ready():
-            logger.warning(
-                f"⏸ {arm.upper()} arm position-control request ignored: "
-                "waiting for /joint_states gate"
-            )
-            return False
-
-        arm_state.mode = ControlMode.POSITION_CONTROL
-        self._seed_arm_target_from_current_pose(arm, arm_state)
-        logger.info(f"🔒 {arm.upper()} arm: Position control ACTIVATED (target reset to current position)")
-        return True
-
-    def _deactivate_position_control(self, arm: str, arm_state: ArmState):
-        """退出 POSITION_CONTROL，并保持 marker 稳定。"""
-        current_position, current_quat, _ = self._capture_current_arm_pose(arm)
-        self._clear_arm_target_state(arm_state)
-        self._set_idle_marker_state(arm, arm_state, current_position, current_quat)
-        logger.info(f"🔓 {arm.upper()} arm: Position control DEACTIVATED")
-
-    def _apply_position_goal(self, arm: str, arm_state: ArmState, goal: ControlGoal):
-        """把输入层目标更新到 arm_state，不直接做 IK。"""
-        if goal.target_position is not None:
-            if goal.metadata and goal.metadata.get("relative_position", False):
-                delta = np.asarray(goal.target_position, dtype=float)
-                delta_base = self.frame_mapper.map_relative_translation(delta)
-                if arm_state.origin_position is not None:
-                    arm_state.target_position = arm_state.origin_position + delta_base
-                elif self.robot_interface:
-                    current_position = self._get_current_ee_position(arm)
-                    arm_state.target_position = current_position + delta_base
-            else:
-                arm_state.target_position = goal.target_position.copy()
-
-            if arm_state.target_position is not None:
-                arm_state.goal_position = arm_state.target_position.copy()
-
-        if goal.target_orientation_quat is not None:
-            q = np.asarray(goal.target_orientation_quat, dtype=float).reshape(-1)
-            if q.size >= 4:
-                q_mapped = self._quat_normalize_wxyz(q[:4])
-                use_marker_grab_drag = bool(
-                    goal.metadata and goal.metadata.get("marker_grab_drag", False)
-                )
-                if use_marker_grab_drag:
-                    q_init = arm_state.origin_target_orientation_quat
-                    if q_init is None:
-                        q_init = self._get_current_ee_orientation(arm)
-                else:
-                    q_init = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
-
-                q_out = self.frame_mapper.map_target_orientation(
-                    controller_delta_quat_wxyz=q_mapped,
-                    origin_target_quat_wxyz=np.asarray(q_init, dtype=float),
-                )
-                arm_state.target_orientation_quat = self._quat_normalize_wxyz(q_out)
-
-        if goal.wrist_roll_deg is not None:
-            if goal.metadata and goal.metadata.get("relative_position", False):
-                arm_state.current_wrist_roll = arm_state.origin_wrist_roll_angle + goal.wrist_roll_deg
-            else:
-                arm_state.current_wrist_roll = goal.wrist_roll_deg
-
-        if goal.wrist_flex_deg is not None:
-            if goal.metadata and goal.metadata.get("relative_position", False):
-                arm_state.current_wrist_flex = arm_state.origin_wrist_flex_angle + goal.wrist_flex_deg
-            else:
-                arm_state.current_wrist_flex = goal.wrist_flex_deg
-
-    def _build_ik_request_for_arm(self, arm_name: str, arm_state: ArmState):
-        """
-        为单臂收集 IK 请求。
-
-        返回值为 None 表示当前帧该臂不做 IK，只维持 tools_link 与 target marker 对齐。
-        """
-        target_name = f"{arm_name}_target"
-        goal_name = f"{arm_name}_goal"
-        actual_pos = self._get_current_ee_position(arm_name)
-        actual_quat = self._get_current_ee_orientation(arm_name)
-        motion_gate_ready = self.robot_interface.is_motion_gate_ready() if self.robot_interface else True
-
-        if arm_state.mode != ControlMode.POSITION_CONTROL or not motion_gate_ready:
-            self.visualizer.update_marker_position(target_name, actual_pos, actual_quat)
-            arm_state.last_mocap_target_position = actual_pos.copy()
-            arm_state.last_mocap_target_quaternion = actual_quat.copy()
-            self.visualizer.hide_marker(goal_name)
-            self.visualizer.hide_frame(f"{target_name}_frame")
-            self.visualizer.hide_frame(f"{goal_name}_frame")
-            self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
-            return None
-
-        if arm_state.target_position is None:
-            self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
-            return None
-
-        ik_target = arm_state.target_position
-        ik_target_quat = arm_state.target_orientation_quat
-        self.visualizer.update_marker_position(target_name, ik_target, arm_state.target_orientation_quat)
-
-        mocap_pos = self.visualizer.get_mocap_position(target_name)
-        if mocap_pos is not None:
-            ik_target = mocap_pos
-            arm_state.last_mocap_target_position = mocap_pos.copy()
-
-        mocap_quat = self.visualizer.get_mocap_quaternion(target_name)
-        if mocap_quat is not None:
-            q = np.asarray(mocap_quat, dtype=float)
-            n = np.linalg.norm(q)
-            if n > 1e-9:
-                ik_target_quat = q / n
-                arm_state.last_mocap_target_quaternion = ik_target_quat.copy()
-
-        ik_target = actual_pos + IK_TARGET_SMOOTHING * (ik_target - actual_pos)
-
-        if arm_state.target_position is not None:
-            self.visualizer.update_marker_position(target_name, arm_state.target_position, arm_state.target_orientation_quat)
-            self.visualizer.update_coordinate_frame(f"{target_name}_frame", arm_state.target_position)
-        if arm_state.goal_position is not None:
-            self.visualizer.update_marker_position(goal_name, arm_state.goal_position)
-            self.visualizer.update_coordinate_frame(f"{goal_name}_frame", arm_state.goal_position)
-
-        self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
-        return {
-            "target": ik_target,
-            "target_quat": ik_target_quat,
-            "wrist_override": (arm_state.target_orientation_quat is None),
-        }
-
-    def _execute_dual_ik_requests(self, ik_requests: Dict[str, Optional[Dict]]):
-        """统一执行双臂 IK，并把解算结果回写到 RobotInterface。"""
-        if ik_requests["left"] is None and ik_requests["right"] is None:
-            return
-
-        left_req = ik_requests["left"]
-        right_req = ik_requests["right"]
-        left_target = left_req["target"] if left_req is not None else self._get_current_ee_position("left")
-        right_target = right_req["target"] if right_req is not None else self._get_current_ee_position("right")
-        left_target_quat = left_req["target_quat"] if left_req is not None else None
-        right_target_quat = right_req["target_quat"] if right_req is not None else None
-        left_before = self.robot_interface.get_arm_angles("left")
-        right_before = self.robot_interface.get_arm_angles("right")
-
-        self._mink_solve_counter += 1
-        left_solution, right_solution = self.robot_interface.solve_dual_ik(
-            left_target_position=left_target,
-            right_target_position=right_target,
-            left_target_orientation=left_target_quat,
-            right_target_orientation=right_target_quat,
-        )
-
-        if left_req is not None:
-            left_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
-            self.robot_interface.update_arm_angles(
-                "left",
-                left_solution,
-                self.left_arm.current_wrist_flex,
-                self.left_arm.current_wrist_roll,
-                left_gripper,
-                wrist_override=left_req["wrist_override"],
-            )
-
-        if right_req is not None:
-            right_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
-            self.robot_interface.update_arm_angles(
-                "right",
-                right_solution,
-                self.right_arm.current_wrist_flex,
-                self.right_arm.current_wrist_roll,
-                right_gripper,
-                wrist_override=right_req["wrist_override"],
-            )
-
-        debug_msgs = []
-        if left_req is not None:
-            left_move = float(np.linalg.norm(np.asarray(left_solution) - np.asarray(left_before)))
-            left_err = float(np.linalg.norm(np.asarray(left_target) - self._get_current_ee_position("left")))
-            if left_err > 0.02 and left_move < 1e-3:
-                debug_msgs.append(
-                    f"LEFT target={np.round(left_target, 4)} current={np.round(self._get_current_ee_position('left'), 4)} "
-                    f"joint_move={left_move:.6f}"
-                )
-        if right_req is not None:
-            right_move = float(np.linalg.norm(np.asarray(right_solution) - np.asarray(right_before)))
-            right_err = float(np.linalg.norm(np.asarray(right_target) - self._get_current_ee_position('right')))
-            if right_err > 0.02 and right_move < 1e-3:
-                debug_msgs.append(
-                    f"RIGHT target={np.round(right_target, 4)} current={np.round(self._get_current_ee_position('right'), 4)} "
-                    f"joint_move={right_move:.6f}"
-                )
-        if debug_msgs:
-            logger.warning("Mink solve produced near-zero joint motion despite target error | " + " | ".join(debug_msgs))
-
+    def _rotate_vec_by_quat_wxyz(self, vec: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
+        """Rotate 3D vector by quaternion [w, x, y, z]."""
+        v = np.asarray(vec, dtype=float).reshape(-1)[:3]
+        q = self._quat_normalize_wxyz(quat_wxyz)
+        vq = np.array([0.0, v[0], v[1], v[2]], dtype=float)
+        qv = self._quat_multiply_wxyz(q, vq)
+        qvq = self._quat_multiply_wxyz(qv, self._quat_inverse_wxyz(q))
+        return qvq[1:4].copy()
+    
     async def _process_commands(self):
         """Process commands from the command queue."""
         try:
@@ -840,31 +715,166 @@ class ControlLoop:
 
     async def _execute_goal(self, goal: ControlGoal):
         """Execute a control goal."""
-        arm_state = self._get_arm_state(goal.arm)
+        arm_state = self.left_arm if goal.arm == "left" else self.right_arm
 
         if goal.metadata and goal.metadata.get("publish_mainpy_joint_target_now", False):
-            self._enter_reference_initialization()
+            if self.robot_interface is not None:
+                ok = self.robot_interface.publish_mainpy_dual_command_now()
+                if ok:
+                    logger.info("📡 X/A long-hold: published one /joint_target aggregate command")
+                else:
+                    logger.warning("📡 X/A long-hold: failed to publish /joint_target aggregate command")
             return
         
         # Handle special reset signal from external input timeout.
         if (goal.metadata and goal.metadata.get("reset_target_to_current", False)):
             if self.robot_interface and arm_state.mode == ControlMode.POSITION_CONTROL:
-                self._seed_arm_target_from_current_pose(goal.arm, arm_state)
+                # Reset target position to current robot position
+                current_position = self._get_current_ee_position(goal.arm)
+                current_angles = self.robot_interface.get_arm_angles(goal.arm)
+                
+                arm_state.target_position = current_position.copy()
+                arm_state.goal_position = current_position.copy()
+                arm_state.target_orientation_quat = self._get_current_ee_orientation(goal.arm)
+                arm_state.origin_target_orientation_quat = arm_state.target_orientation_quat.copy()
+                arm_state.origin_position = current_position.copy()
+                arm_state.current_wrist_roll = current_angles[WRIST_ROLL_INDEX]
+                arm_state.current_wrist_flex = current_angles[WRIST_FLEX_INDEX]
+                arm_state.origin_wrist_roll_angle = current_angles[WRIST_ROLL_INDEX]
+                arm_state.origin_wrist_flex_angle = current_angles[WRIST_FLEX_INDEX]
+                arm_state.controller_to_target_offset_quat = None
+                
                 logger.info(f"🔄 {goal.arm.upper()} arm: Target position reset to current robot position (idle timeout)")
             return
         
         # Handle mode changes (only if mode is specified)
         if goal.mode is not None and goal.mode != arm_state.mode:
             if goal.mode == ControlMode.POSITION_CONTROL:
-                if not self._activate_position_control(goal.arm, arm_state):
+                if self.robot_interface and not self.robot_interface.is_motion_gate_ready():
+                    logger.warning(
+                        f"⏸ {goal.arm.upper()} arm position-control request ignored: "
+                        "waiting for /joint_states gate"
+                    )
                     return
+                # Activate position control - always reset target to current position
+                arm_state.mode = ControlMode.POSITION_CONTROL
+                
+                if self.robot_interface:
+                    current_position = self._get_current_ee_position(goal.arm)
+                    current_angles = self.robot_interface.get_arm_angles(goal.arm)
+                    
+                    # Reset everything to current position (like VR grip press)
+                    arm_state.target_position = current_position.copy()
+                    arm_state.goal_position = current_position.copy()
+                    arm_state.target_orientation_quat = self._get_current_ee_orientation(goal.arm)
+                    arm_state.origin_target_orientation_quat = arm_state.target_orientation_quat.copy()
+                    arm_state.origin_position = current_position.copy()
+                    arm_state.current_wrist_roll = current_angles[WRIST_ROLL_INDEX]
+                    arm_state.current_wrist_flex = current_angles[WRIST_FLEX_INDEX]
+                    arm_state.origin_wrist_roll_angle = current_angles[WRIST_ROLL_INDEX]
+                    arm_state.origin_wrist_flex_angle = current_angles[WRIST_FLEX_INDEX]
+                    arm_state.controller_to_target_offset_quat = None
+                
+                logger.info(f"🔒 {goal.arm.upper()} arm: Position control ACTIVATED (target reset to current position)")
                 
             elif goal.mode == ControlMode.IDLE:
-                self._deactivate_position_control(goal.arm, arm_state)
+                # Deactivate position control without introducing a one-tick mocap jump.
+                # Keep target marker aligned to current EE so release is stable.
+                current_position = self._get_current_ee_position(goal.arm)
+                current_quat = self._get_current_ee_orientation(goal.arm)
+
+                arm_state.mode = ControlMode.IDLE
+                arm_state.target_position = None
+                arm_state.target_orientation_quat = None
+                arm_state.origin_target_orientation_quat = None
+                arm_state.goal_position = None
+                arm_state.origin_position = None
+                arm_state.origin_wrist_roll_angle = 0.0
+                arm_state.origin_wrist_flex_angle = 0.0
+                arm_state.controller_to_target_offset_quat = None
+
+                # Seed mocap history to avoid false "drag changed" detection immediately after release.
+                arm_state.last_mocap_target_position = current_position.copy()
+                arm_state.last_mocap_target_quaternion = current_quat.copy()
+
+                # Keep target marker at current EE pose when leaving grab mode.
+                if self.visualizer:
+                    self.visualizer.update_marker_position(
+                        f"{goal.arm}_target", current_position, current_quat
+                    )
+                    self.visualizer.hide_marker(f"{goal.arm}_goal")
+                    self.visualizer.hide_frame(f"{goal.arm}_goal_frame")
+                
+                logger.info(f"🔓 {goal.arm.upper()} arm: Position control DEACTIVATED")
         
         # Position control uses absolute offset from origin.
         if goal.target_position is not None and arm_state.mode == ControlMode.POSITION_CONTROL:
-            self._apply_position_goal(goal.arm, arm_state, goal)
+            if goal.metadata and goal.metadata.get("relative_position", False):
+                delta = np.asarray(goal.target_position, dtype=float)
+                delta_base = self._rotate_vec_by_quat_wxyz(delta, self._vr_delta_to_base_quat)
+                # Relative input is interpreted as absolute offset from arm origin.
+                if arm_state.origin_position is not None:
+                    arm_state.target_position = arm_state.origin_position + delta_base
+                    arm_state.goal_position = arm_state.target_position.copy()
+                else:
+                    # No origin set yet, use current position as base
+                    if self.robot_interface:
+                        current_position = self._get_current_ee_position(goal.arm)
+                        arm_state.target_position = current_position + delta_base
+                        arm_state.goal_position = arm_state.target_position.copy()
+            else:
+                # Absolute position (legacy - should not be used anymore)
+                arm_state.target_position = goal.target_position.copy()
+                arm_state.goal_position = goal.target_position.copy()
+
+            if goal.target_orientation_quat is not None:
+                q = np.asarray(goal.target_orientation_quat, dtype=float).reshape(-1)
+                if q.size >= 4:
+                    q_in = self._quat_normalize_wxyz(q[:4])
+                    q_mapped = self._quat_normalize_wxyz(q_in)
+                    use_marker_grab_drag = bool(
+                        goal.metadata and goal.metadata.get("marker_grab_drag", False)
+                    )
+
+                    if use_marker_grab_drag:
+                        # Grip-drag mode: input quaternion is controller-local delta
+                        # relative to grip press. Convert that delta into target frame,
+                        # then apply it on the grip-time target orientation.
+                        R_delta_hand = self._quat_to_rotation_matrix_wxyz(q_mapped)
+                        S = self._controller_delta_to_target_axis_map
+                        R_delta_target = S @ R_delta_hand @ S.T
+                        U = self._relative_rotation_post_axis_map
+                        R_delta_target = U @ R_delta_target @ U.T
+                        q_delta_target = self._quat_from_rotation_matrix_wxyz(
+                            R_delta_target
+                        )
+                        q_init = arm_state.origin_target_orientation_quat
+                        if q_init is None:
+                            q_init = self._get_current_ee_orientation(goal.arm)
+                        q_init = self._quat_normalize_wxyz(np.asarray(q_init, dtype=float))
+                        q_out = self._quat_multiply_wxyz(q_init, q_delta_target)
+                        arm_state.target_orientation_quat = self._quat_normalize_wxyz(q_out)
+                    else:
+                        # Fallback absolute quaternion path.
+                        arm_state.target_orientation_quat = q_mapped
+            
+            # Handle wrist roll using absolute offset from origin.
+            if goal.wrist_roll_deg is not None:
+                if goal.metadata and goal.metadata.get("relative_position", False):
+                    # Relative input is interpreted from grip-time wrist origin.
+                    arm_state.current_wrist_roll = arm_state.origin_wrist_roll_angle + goal.wrist_roll_deg
+                else:
+                    # Absolute wrist roll (legacy)
+                    arm_state.current_wrist_roll = goal.wrist_roll_deg
+            
+            # Handle wrist flex using absolute offset from origin.
+            if goal.wrist_flex_deg is not None:
+                if goal.metadata and goal.metadata.get("relative_position", False):
+                    # Relative input is interpreted from grip-time wrist origin.
+                    arm_state.current_wrist_flex = arm_state.origin_wrist_flex_angle + goal.wrist_flex_deg
+                else:
+                    # Absolute wrist flex (legacy)
+                    arm_state.current_wrist_flex = goal.wrist_flex_deg
         
         # Handle gripper control (independent of mode)
         if goal.gripper_closed is not None and self.robot_interface:
@@ -902,9 +912,110 @@ class ControlLoop:
         }
 
         for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
-            ik_requests[arm_name] = self._build_ik_request_for_arm(arm_name, arm_state)
+            target_name = f"{arm_name}_target"
+            goal_name = f"{arm_name}_goal"
+            actual_pos = self._get_current_ee_position(arm_name)
+            actual_quat = self._get_current_ee_orientation(arm_name)
+            motion_gate_ready = self.robot_interface.is_motion_gate_ready() if self.robot_interface else True
 
-        self._execute_dual_ik_requests(ik_requests)
+            # IDLE policy: target marker must remain exactly on tools_link every frame.
+            # This prevents idle drift and avoids grip press/release transients.
+            if arm_state.mode != ControlMode.POSITION_CONTROL or not motion_gate_ready:
+                self.visualizer.update_marker_position(target_name, actual_pos, actual_quat)
+                arm_state.last_mocap_target_position = actual_pos.copy()
+                arm_state.last_mocap_target_quaternion = actual_quat.copy()
+                self.visualizer.hide_marker(goal_name)
+                self.visualizer.hide_frame(f"{target_name}_frame")
+                self.visualizer.hide_frame(f"{goal_name}_frame")
+                self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
+                continue
+
+            should_solve = arm_state.target_position is not None
+            if should_solve:
+                ik_target = arm_state.target_position
+                ik_target_quat = arm_state.target_orientation_quat
+
+                # Position-control mode commands the marker from input goals.
+                self.visualizer.update_marker_position(target_name, ik_target, arm_state.target_orientation_quat)
+
+                mocap_pos = self.visualizer.get_mocap_position(target_name)
+                if mocap_pos is not None:
+                    ik_target = mocap_pos
+                    arm_state.last_mocap_target_position = mocap_pos.copy()
+                mocap_quat = self.visualizer.get_mocap_quaternion(target_name)
+                if mocap_quat is not None:
+                    q = np.asarray(mocap_quat, dtype=float)
+                    n = np.linalg.norm(q)
+                    if n > 1e-9:
+                        q = q / n
+                        ik_target_quat = q
+                        arm_state.last_mocap_target_quaternion = q.copy()
+
+                # 2) Legacy smoothing / target shaping before IK.
+                ik_target = actual_pos + IK_TARGET_SMOOTHING * (ik_target - actual_pos)
+
+                # 3) 收集双臂IK请求，统一交给共享Mink求解器。
+                ik_requests[arm_name] = {
+                    "target": ik_target,
+                    "target_quat": ik_target_quat,
+                    "wrist_override": (arm_state.target_orientation_quat is None),
+                }
+
+            # 4) Marker/goal visibility policy.
+            if arm_state.mode == ControlMode.POSITION_CONTROL:
+                if arm_state.target_position is not None:
+                    self.visualizer.update_marker_position(target_name, arm_state.target_position, arm_state.target_orientation_quat)
+                    self.visualizer.update_coordinate_frame(f"{target_name}_frame", arm_state.target_position)
+                if arm_state.goal_position is not None:
+                    self.visualizer.update_marker_position(goal_name, arm_state.goal_position)
+                    self.visualizer.update_coordinate_frame(f"{goal_name}_frame", arm_state.goal_position)
+            else:
+                self.visualizer.hide_marker(goal_name)
+                self.visualizer.hide_frame(f"{target_name}_frame")
+                self.visualizer.hide_frame(f"{goal_name}_frame")
+
+            # Always show current tools_link pose as an "actual" marker.
+            self.visualizer.update_marker_position(f"{arm_name}_actual", actual_pos, actual_quat)
+
+        # 4.5) 双臂一次联合IK求解（与 arm_arm620_dual 示例一致）。
+        if ik_requests["left"] is not None or ik_requests["right"] is not None:
+            left_req = ik_requests["left"]
+            right_req = ik_requests["right"]
+
+            left_target = left_req["target"] if left_req is not None else self._get_current_ee_position("left")
+            right_target = right_req["target"] if right_req is not None else self._get_current_ee_position("right")
+            left_target_quat = left_req["target_quat"] if left_req is not None else None
+            right_target_quat = right_req["target_quat"] if right_req is not None else None
+
+            self._mink_solve_counter += 1
+            left_solution, right_solution = self.robot_interface.solve_dual_ik(
+                left_target_position=left_target,
+                right_target_position=right_target,
+                left_target_orientation=left_target_quat,
+                right_target_orientation=right_target_quat,
+            )
+
+            if left_req is not None:
+                left_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
+                self.robot_interface.update_arm_angles(
+                    "left",
+                    left_solution,
+                    self.left_arm.current_wrist_flex,
+                    self.left_arm.current_wrist_roll,
+                    left_gripper,
+                    wrist_override=left_req["wrist_override"],
+                )
+
+            if right_req is not None:
+                right_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
+                self.robot_interface.update_arm_angles(
+                    "right",
+                    right_solution,
+                    self.right_arm.current_wrist_flex,
+                    self.right_arm.current_wrist_roll,
+                    right_gripper,
+                    wrist_override=right_req["wrist_override"],
+                )
 
         # 5) Push commanded targets into simulation + step once.
         if self.config.require_state_feedback:
@@ -1157,22 +1268,7 @@ class ControlLoop:
             if active_arms and self.robot_interface:
                 left_angles = self.robot_interface.get_arm_angles("left")
                 right_angles = self.robot_interface.get_arm_angles("right")
-                details = []
-                for arm_name, arm_state in (("left", self.left_arm), ("right", self.right_arm)):
-                    if arm_state.mode != ControlMode.POSITION_CONTROL or arm_state.target_position is None:
-                        continue
-                    actual_pos = self._get_current_ee_position(arm_name)
-                    target_pos = np.asarray(arm_state.target_position, dtype=float).reshape(-1)[:3]
-                    pos_err = float(np.linalg.norm(target_pos - actual_pos))
-                    details.append(
-                        f"{arm_name.upper()}_err={pos_err:.4f}m"
-                    )
-                bridge_state = getattr(self.robot_interface, "bridge_state", "unknown")
-                extra = f" | {' '.join(details)}" if details else ""
-                logger.info(
-                    f"🤖 Active control: {', '.join(active_arms)} | "
-                    f"bridge={bridge_state} | Left: {left_angles.round(1)} | Right: {right_angles.round(1)}{extra}"
-                )
+                logger.info(f"🤖 Active control: {', '.join(active_arms)} | Left: {left_angles.round(1)} | Right: {right_angles.round(1)}")
     
     @property
     def status(self) -> Dict:
@@ -1185,4 +1281,4 @@ class ControlLoop:
             "left_arm_connected": self.robot_interface.get_arm_connection_status("left") if self.robot_interface else False,
             "right_arm_connected": self.robot_interface.get_arm_connection_status("right") if self.robot_interface else False,
             "visualizer_connected": self.visualizer.is_connected if self.visualizer else False,
-        }
+        } 
