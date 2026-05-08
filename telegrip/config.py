@@ -69,6 +69,9 @@ DEFAULT_CONFIG = {
         "teleop_frame": {
             "translation_euler_xyz_deg": [0.0, 0.0, 180.0],
             "relative_rotation_axis_map": [],
+            "relative_rotation_axis_map_calibration": [],
+            "axis_map_calibration_reference_euler_xyz_deg": [0.0, 0.0, 0.0],
+            "auto_update_relative_rotation_axis_map_from_ee_correction": False,
             "ee_target_orientation_correction_euler_xyz_deg": [0.0, 0.0, 0.0],
         },
         "mink": {
@@ -310,6 +313,9 @@ class TelegripConfig:
     )
     teleop_frame_translation_euler_xyz_deg: Optional[List[float]] = None
     teleop_frame_relative_rotation_axis_map: Optional[List[List[float]]] = None
+    teleop_frame_relative_rotation_axis_map_calibration: Optional[List[List[float]]] = None
+    teleop_frame_axis_map_calibration_reference_euler_xyz_deg: Optional[List[float]] = None
+    teleop_frame_auto_update_relative_rotation_axis_map_from_ee_correction: bool = False
     teleop_frame_ee_target_orientation_correction_euler_xyz_deg: Optional[List[float]] = None
     autoconnect: bool = False
     log_level: str = "warning"
@@ -365,6 +371,30 @@ class TelegripConfig:
                 self.teleop_frame_relative_rotation_axis_map = cfg_map.copy()
             else:
                 self.teleop_frame_relative_rotation_axis_map = []
+        if self.teleop_frame_relative_rotation_axis_map_calibration is None:
+            cfg_map_calib = teleop_frame_cfg.get(
+                "relative_rotation_axis_map_calibration",
+                self.teleop_frame_relative_rotation_axis_map,
+            )
+            if isinstance(cfg_map_calib, list):
+                self.teleop_frame_relative_rotation_axis_map_calibration = cfg_map_calib.copy()
+            else:
+                self.teleop_frame_relative_rotation_axis_map_calibration = []
+        if self.teleop_frame_axis_map_calibration_reference_euler_xyz_deg is None:
+            cfg_axis_map_ref = teleop_frame_cfg.get(
+                "axis_map_calibration_reference_euler_xyz_deg",
+                [0.0, 0.0, 0.0],
+            )
+            if isinstance(cfg_axis_map_ref, list):
+                self.teleop_frame_axis_map_calibration_reference_euler_xyz_deg = cfg_axis_map_ref[:3]
+            else:
+                self.teleop_frame_axis_map_calibration_reference_euler_xyz_deg = [0.0, 0.0, 0.0]
+        self.teleop_frame_auto_update_relative_rotation_axis_map_from_ee_correction = bool(
+            teleop_frame_cfg.get(
+                "auto_update_relative_rotation_axis_map_from_ee_correction",
+                self.teleop_frame_auto_update_relative_rotation_axis_map_from_ee_correction,
+            )
+        )
         if self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg is None:
             cfg_correction = teleop_frame_cfg.get(
                 "ee_target_orientation_correction_euler_xyz_deg",
@@ -382,6 +412,16 @@ class TelegripConfig:
             if isinstance(self.teleop_frame_relative_rotation_axis_map, list)
             else []
         )
+        self.teleop_frame_relative_rotation_axis_map_calibration = (
+            self.teleop_frame_relative_rotation_axis_map_calibration
+            if isinstance(self.teleop_frame_relative_rotation_axis_map_calibration, list)
+            else []
+        )
+        self.teleop_frame_axis_map_calibration_reference_euler_xyz_deg = [
+            float(v) for v in (
+                self.teleop_frame_axis_map_calibration_reference_euler_xyz_deg[:3] + [0.0, 0.0, 0.0]
+            )[:3]
+        ]
         self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg = [
             float(v) for v in (
                 self.teleop_frame_ee_target_orientation_correction_euler_xyz_deg[:3] + [0.0, 0.0, 0.0]
