@@ -1,111 +1,58 @@
 control:
-  enable_sim: true
   enable_gui: true
+  enable_sim: true
   keyboard:
     angle_step: 5
     enabled: false
     gripper_step: 10.0
     pos_step: 0.01
-  teleop_frame:
-    # 相对平移变化量的坐标映射（单位：度，按 XYZ 欧拉角解释）。
-    #
-    # 记：
-    #   delta_vr     = VR 手柄相对起点的平移变化量
-    #   R_translation = 由 translation_euler_xyz_deg 生成的旋转矩阵
-    #   delta_target = 映射到机器人目标坐标系后的平移变化量
-    #
-    # 则平移映射公式为：
-    #   delta_target = R_translation * delta_vr
-    #
-    # 在位置控制里，最终目标位置按下面方式更新：
-    #   p_target = p_origin + delta_target
-    #
-    # 用途：
-    #   当你发现“手柄平移方向”整体不对时，优先修改这里。
-    #
-    # 例子：
-    #   [0, 0, 180] 等价于绕 Z 轴旋转 180 度，
-    #   对平移变化量表现为：X -> -X, Y -> -Y, Z -> Z
-    translation_euler_xyz_deg: [0.0, 0.0, 180.0]
-
-    # 相对旋转增量的最终轴映射矩阵 U（3x3 正交矩阵）。
-    #
-    # 记：
-    #   R_delta_hand   = 手柄相对参考姿态的旋转增量矩阵
-    #   U              = relative_rotation_axis_map
-    #   R_delta_target = 映射到机器人目标姿态坐标系后的旋转增量
-    #
-    # 则旋转增量映射公式为：
-    #   R_delta_target = U * R_delta_hand * U^T
-    #
-    # 注意：
-    #   1. 这里配置的是“最终总映射矩阵”，不是多段叠加配置。
-    #   2. 如果你想在已有映射基础上继续叠加修正，需要先做矩阵乘法，
-    #      把合成后的结果填到这里。
-    #
-    # 当前这个矩阵表示：
-    #   X -> -X
-    #   Y -> -Z
-    #   Z -> +Y
-    #
-    # 这是你在现有 Y/Z 交换映射基础上，再叠加一次符号修正后的总结果。
-    relative_rotation_axis_map:
-    - [-1, 0, 0]
-    - [0, 0, -1]
-    - [0, 1, 0]
-
-    # 末端目标姿态固定补偿 q_ee_fix（单位：度，按 XYZ 欧拉角解释）。
-    #
-    # 记：
-    #   q_origin         = 进入当前位置控制时的末端初始目标姿态
-    #   q_delta_target   = 由 R_delta_target 转成的四元数
-    #   q_ee_fix         = 由 ee_target_orientation_correction_euler_xyz_deg 转成的固定补偿四元数
-    #   q_target         = 最终送给 target site / marker 的目标姿态
-    #
-    # 则目标姿态合成公式为：
-    #   q_target = q_origin * q_delta_target * q_ee_fix
-    #
-    # 用途：
-    #   当平移映射和旋转增量方向都已经正确，
-    #   但工具头 / 夹爪的“静态朝向”仍然整体偏一个固定角度时，修改这里。
-    ee_target_orientation_correction_euler_xyz_deg: [-90.0, 0.0, 0.0]
   mink:
-    # IK 积分步长（单位：秒）。越大单步动作越激进，越小越平滑。
     dt: 0.005
     enabled: true
     end_effector_site: tools_link
-    # 任务层 LM 阻尼（无量纲）。增大可提高奇异位姿附近稳定性，但会降低灵敏度。
     lm_damping: 1.0
-    # 每个控制周期内的 IK 最大迭代次数。越大收敛更充分，但计算开销更高。
     max_iters: 20
     mujoco_scene: mink/examples/arm620/scene_dual.xml
-    # 末端姿态误差权重（无量纲）。越大越优先“对准方向”。
     orientation_cost: 0.1
-    # 姿态收敛阈值（单位：弧度，旋转向量范数）。越小要求越严格。
     orientation_error_threshold: 0.01
-    # 末端位置误差权重（无量纲）。越大越优先“到目标点”。
     position_cost: 1.0
-    # 位置收敛阈值（单位：米）。越小要求越严格。
     position_error_threshold: 0.01
-    # 关节姿态保持权重（无量纲）。越大越抑制关节剧烈变化，动作更稳但更“钝”。
     posture_cost: 0.0001
-    # 求解器正则阻尼（无量纲）。增大可抑制抖动与噪声放大，但跟踪会变慢。
-    solve_damping: 0.00001
+    solve_damping: 1.0e-05
+  teleop_frame:
+    ee_target_orientation_correction_euler_xyz_deg:
+    - 0.0
+    - 90.0
+    - 0.0
+    relative_rotation_axis_map:
+    - - 0
+      - 0
+      - 1
+    - - -1
+      - 0
+      - 0
+    - - 0
+      - -1
+      - 0
+    translation_euler_xyz_deg:
+    - 0.0
+    - 0.0
+    - 180.0
   use_mink: true
   vr:
     enabled: true
-    orientation_reference_mode: global_calibration # grip_press global_calibration
+    orientation_reference_mode: global_calibration
     orientation_reference_quat_xyzw:
       left:
-      - 0
-      - 0
-      - 0
-      - 1
+      - 0.629029622677635
+      - 0.32124424249251393
+      - -0.3080155343027612
+      - 0.6373776753916218
       right:
-      - 0
-      - 0
-      - 0
-      - 1
+      - 0.666625536852661
+      - 0.2697789038849902
+      - -0.2999743508476453
+      - 0.6267735838945739
 gnirehtet:
   args: []
   binary: gnirehtet-rust-linux64/gnirehtet
@@ -116,7 +63,6 @@ gripper:
   open_angle: 0.0
 ik:
   hysteresis_threshold: 0.05
-  initial_reached_tolerance_deg: 5.0
   initial_joint_positions_deg:
     left:
     - 90.0
@@ -132,6 +78,7 @@ ik:
     - -90.0
     - -90.0
     - 30.0
+  initial_reached_tolerance_deg: 6.0
   movement_penalty_weight: 0.01
   position_error_threshold: 0.01
   use_reference_poses: true
@@ -142,30 +89,30 @@ network:
 paths:
   urdf_path: mink/examples/arm620/urdf/arm620.urdf
 robot:
-  command_backend: ros2_topic
-  require_joint_state_for_motion: true
-  ros2:
-    left_joint_state_topic: /left/joint_states_sim
-    right_joint_state_topic: /right/joint_states_sim
-    left_joint_cmd_topic: /left/joint_target
-    right_joint_cmd_topic: /right/joint_target
-    aggregate_joint_cmd_topic: /joint_target
   arm_controller:
-    workspace: /home/nvidia/Projects/universal-arm-controller
-    module_dir: ""
-    left_mapping: left_arm
-    right_mapping: right_arm
     interpolation_alpha: 0.35
+    left_mapping: left_arm
     max_step_deg: 6.0
+    module_dir: ''
+    right_mapping: right_arm
+    workspace: /home/nvidia/Projects/universal-arm-controller
+  command_backend: ros2_topic
   left_arm:
     enabled: true
     interface: rclpy
     name: Left ARM620
+  require_joint_state_for_motion: true
   require_state_feedback: true
   right_arm:
     enabled: true
     interface: rclpy
     name: Right ARM620
+  ros2:
+    aggregate_joint_cmd_topic: /joint_target
+    left_joint_cmd_topic: /left/joint_target
+    left_joint_state_topic: /left/joint_states_sim
+    right_joint_cmd_topic: /right/joint_target
+    right_joint_state_topic: /right/joint_states_sim
   send_interval: 0.001
   vr_to_robot_scale: 1
 ssl:

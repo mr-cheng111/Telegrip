@@ -43,7 +43,7 @@ class TeleopFrameMapper:
        R_delta_target = U * R_delta_target * U^T
 
     3. 目标姿态合成:
-       q_target = q_origin_target * q_delta_target * q_ee_fix
+       q_target = (q_origin_target * q_ee_fix) * q_delta_target
     """
 
     def __init__(self, config: TeleopFrameMapperConfig):
@@ -260,8 +260,14 @@ class TeleopFrameMapper:
         R_delta_target = U @ R_delta_target @ U.T
         q_delta_target = self.quat_from_rotation_matrix_wxyz(R_delta_target)
 
-        q_target = self.quat_multiply_wxyz(q_origin, q_delta_target)
-        q_target = self.quat_multiply_wxyz(
-            q_target, self.ee_target_orientation_correction_quat_wxyz
+        # 将 q_ee_fix 并入参考姿态：
+        #   q_ref_aligned = q_origin_target * q_ee_fix
+        #   q_target      = q_ref_aligned * q_delta_target
+        #
+        # 这样 q_ee_fix 只负责修正“初始静态朝向”，
+        # 不再改变后续 q_delta_target 的 XYZ 轴语义。
+        q_ref_aligned = self.quat_multiply_wxyz(
+            q_origin, self.ee_target_orientation_correction_quat_wxyz
         )
+        q_target = self.quat_multiply_wxyz(q_ref_aligned, q_delta_target)
         return self.normalize_wxyz(q_target)

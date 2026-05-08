@@ -171,8 +171,22 @@ class VRWebSocketServer(BaseInputProvider):
         }
         update_config_data(cfg)
 
+    def _set_orientation_refs_from_xyzw(self, left_xyzw: np.ndarray, right_xyzw: np.ndarray, reason: str):
+        """用当前左右手柄姿态直接更新姿态参考零点。"""
+        left_norm = self._normalize_xyzw(np.asarray(left_xyzw, dtype=float))
+        right_norm = self._normalize_xyzw(np.asarray(right_xyzw, dtype=float))
+        if left_norm is None or right_norm is None:
+            logger.warning("Could not update orientation references: invalid controller quaternion")
+            return
+        self.hand_orientation_ref_xyzw["left"] = left_norm
+        self.hand_orientation_ref_xyzw["right"] = right_norm
+        self._save_orientation_refs_to_config()
+        self._log_controller_reference_pose("left", left_norm, reason)
+        self._log_controller_reference_pose("right", right_norm, reason)
+        logger.info("Updated VR orientation references for both hands")
+
     def _update_orientation_calibration_hold(self, left_data: Dict, right_data: Dict):
-        """LEFT X + RIGHT A 长按 3 秒后，直接触发一次 /joint_target 聚合发布。"""
+        """LEFT X + RIGHT A 长按 3 秒后，更新双手姿态参考零点。"""
         # Trigger-like value path (same style as trigger > 0.5), then fallbacks.
         lx = float(left_data.get("x", 0.0)) > 0.5
         ra = float(right_data.get("a", 0.0)) > 0.5
@@ -240,21 +254,33 @@ class VRWebSocketServer(BaseInputProvider):
             return
 
         if now - self._calib_hold_start_ts >= 3.0:
-            publish_goal = ControlGoal(
-                arm="left",
-                metadata={
-                    "source": "vr_xa_long_hold",
-                    "publish_mainpy_joint_target_now": True,
-                },
+            left_xyzw = np.array(
+                [float(lq["x"]), float(lq["y"]), float(lq["z"]), float(lq["w"])],
+                dtype=float,
+            )
+            right_xyzw = np.array(
+                [float(rq["x"]), float(rq["y"]), float(rq["z"]), float(rq["w"])],
+                dtype=float,
+            )
+            self._set_orientation_refs_from_xyzw(
+                left_xyzw,
+                right_xyzw,
+                reason="xa_recalibration",
             )
             try:
-                self.command_queue.put_nowait(publish_goal)
+                recalib_goal = ControlGoal(
+                    arm="left",
+                    metadata={
+                        "source": "vr_xa_long_hold",
+                        "publish_mainpy_joint_target_now": True,
+                    },
+                )
+                self.command_queue.put_nowait(recalib_goal)
             except Exception:
-                # 队列满时退化为 await 路径不方便，这里仅记录错误并等待下一次长按。
                 logger.warning("Could not queue X/A long-hold publish request")
                 return
             self._calib_hold_done = True
-            print("✅ [x/a] queued one immediate /joint_target aggregate publish", flush=True)
+            print("✅ [x/a] updated orientation references for both hands", flush=True)
 
     def _get_local_ip(self) -> str:
         """Get the local IP address of this machine."""

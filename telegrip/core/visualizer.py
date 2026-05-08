@@ -557,6 +557,24 @@ class MuJoCoVisualizer:
             mujoco.mju_mat2Quat(quat, self.data.site_xmat[site_id])
             return quat.copy()
 
+    def get_body_quaternion(self, body_name: str) -> Optional[np.ndarray]:
+        """获取指定 body 在世界坐标系下的姿态四元数 [w, x, y, z]。"""
+        if not self.is_connected:
+            return None
+
+        try:
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        except Exception:
+            return None
+        if body_id is None or body_id < 0:
+            return None
+
+        with self._mujoco_lock:
+            q = np.asarray(self.data.xquat[body_id], dtype=float).reshape(-1)
+            if q.size < 4:
+                return None
+            return q[:4].copy()
+
     def get_joint_angles_deg(self, arm: str) -> Optional[np.ndarray]:
         """Get current simulated joint angles (degrees) for one arm."""
         if not self.is_connected:

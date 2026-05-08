@@ -43,6 +43,7 @@ class ArmRuntimeState:
     current_wrist_flex: float = 0.0
     last_mocap_target_position: Optional[np.ndarray] = None
     last_mocap_target_quaternion: Optional[np.ndarray] = None
+    base_reference_orientation_quat: Optional[np.ndarray] = None
 
     def reset(self):
         """完全重置单臂运行态。"""
@@ -58,6 +59,7 @@ class ArmRuntimeState:
         self.current_wrist_flex = 0.0
         self.last_mocap_target_position = None
         self.last_mocap_target_quaternion = None
+        self.base_reference_orientation_quat = None
 
     def clear_target_state(self):
         """清空当前位置控制相关目标，但保留当前 wrist 实时值。"""
@@ -69,6 +71,7 @@ class ArmRuntimeState:
         self.origin_position = None
         self.origin_wrist_roll_angle = 0.0
         self.origin_wrist_flex_angle = 0.0
+        self.base_reference_orientation_quat = None
 
     def seed_from_pose(
         self,
@@ -520,6 +523,19 @@ class ControlLoop:
                         return q / n
         return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
 
+    def _get_base_link_orientation(self) -> np.ndarray:
+        """获取机器人 base_link 在世界坐标系下的姿态 [w, x, y, z]。"""
+        if self.visualizer:
+            base_quat = self.visualizer.get_body_quaternion("base_link")
+            if base_quat is not None:
+                q = np.asarray(base_quat, dtype=float).reshape(-1)
+                if q.size >= 4:
+                    q = q[:4]
+                    n = np.linalg.norm(q)
+                    if n > 1e-9:
+                        return q / n
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
     @staticmethod
     def _quat_normalize_wxyz(q: np.ndarray) -> np.ndarray:
         return TeleopFrameMapper.normalize_wxyz(q)
@@ -571,6 +587,7 @@ class ControlLoop:
             wrist_roll_deg=current_angles[WRIST_ROLL_INDEX],
             wrist_flex_deg=current_angles[WRIST_FLEX_INDEX],
         )
+        arm_state.base_reference_orientation_quat = self._get_base_link_orientation()
 
     def _set_idle_marker_state(self, arm: str, arm_state: ArmRuntimeState, current_position: np.ndarray, current_quat: np.ndarray):
         """退出控制时，让 target marker 与当前 tools_link 严格重合。"""
@@ -645,14 +662,10 @@ class ControlLoop:
             q = np.asarray(goal.target_orientation_quat, dtype=float).reshape(-1)
             if q.size >= 4:
                 q_mapped = self._quat_normalize_wxyz(q[:4])
-                use_marker_grab_drag = bool(
-                    goal.metadata and goal.metadata.get("marker_grab_drag", False)
-                )
-                if use_marker_grab_drag:
-                    q_init = arm_state.origin_target_orientation_quat
-                    if q_init is None:
-                        q_init = self._get_current_ee_orientation(arm)
-                else:
+                q_init = arm_state.base_reference_orientation_quat
+                if q_init is None:
+                    q_init = self._get_base_link_orientation()
+                if q_init is None:
                     q_init = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
 
                 q_out = self.frame_mapper.map_target_orientation(
