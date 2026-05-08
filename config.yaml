@@ -20,35 +20,10 @@ control:
     posture_cost: 0.0001
     solve_damping: 1.0e-05
   teleop_frame:
-    auto_update_relative_rotation_axis_map_from_ee_correction: true
-    axis_map_calibration_reference_euler_xyz_deg:
-    - -90.0
-    - 0.0
-    - -90.0
     ee_target_orientation_correction_euler_xyz_deg:
     - -90.0
     - 0.0
     - -90.0
-    relative_rotation_axis_map:
-    - - 1
-      - 0
-      - 0
-    - - 0
-      - 0
-      - 1
-    - - 0
-      - -1
-      - 0
-    relative_rotation_axis_map_calibration:
-    - - 1
-      - 0
-      - 0
-    - - 0
-      - 0
-      - 1
-    - - 0
-      - -1
-      - 0
     translation_euler_xyz_deg:
     - 0.0
     - 0.0
@@ -59,15 +34,15 @@ control:
     orientation_reference_mode: global_calibration
     orientation_reference_quat_xyzw:
       left:
-      - 0.7189942079970709
-      - 0.10628149249624902
-      - -0.059859074726226244
-      - 0.6842283715195933
+      - -0.688984811615382
+      - -0.25416233118532
+      - 0.25527887326520443
+      - -0.6289150464364865
       right:
-      - 0.7573178340484125
-      - 0.03400703217848226
-      - -0.028284446049921624
-      - 0.6515467827457074
+      - 0.7493498926350431
+      - 0.10668732040735462
+      - -0.13440800137239384
+      - 0.6395522208852271
 gnirehtet:
   args: []
   binary: gnirehtet-rust-linux64/gnirehtet

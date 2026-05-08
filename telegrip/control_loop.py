@@ -666,6 +666,14 @@ class ControlLoop:
                 if q_init is None:
                     q_init = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
 
+                if logger.isEnabledFor(logging.INFO):
+                    effective_map = self.frame_mapper.get_effective_relative_rotation_axis_map(
+                        np.asarray(q_init, dtype=float)
+                    )
+                    logger.info(
+                        f"{goal.arm.upper()} semantic relative rotation axis map:\n{effective_map}"
+                    )
+
                 q_out = self.frame_mapper.map_target_orientation(
                     controller_delta_quat_wxyz=q_mapped,
                     origin_target_quat_wxyz=np.asarray(q_init, dtype=float),

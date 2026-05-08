@@ -24,15 +24,7 @@ class TeleopFrameMapperConfig:
     controller_delta_to_target_axis_map: np.ndarray = field(
         default_factory=lambda: np.eye(3, dtype=float)
     )
-    relative_rotation_post_axis_map: np.ndarray = field(
-        default_factory=lambda: np.eye(3, dtype=float)
-    )
     ee_target_orientation_correction_euler_xyz_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    auto_update_relative_rotation_axis_map_from_ee_correction: bool = False
-    axis_map_calibration_reference_euler_xyz_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    relative_rotation_post_axis_map_calibration: np.ndarray = field(
-        default_factory=lambda: np.eye(3, dtype=float)
-    )
 
 
 class TeleopFrameMapper:
@@ -51,12 +43,31 @@ class TeleopFrameMapper:
        q_target = (q_origin_target * q_ee_fix) * q_delta_target
 
     4. 当启用“R_fix 驱动 U 自动更新”时：
-       U_eff = R_fix_new * R_fix_calib^{-1} * U_calib
+       不再直接依赖手工维护的 U_calib，而是按语义动态求解 U_eff。
 
-       其中：
-       - R_fix_calib: 标定成功时那组 ee 修正
-       - U_calib:     与之配套调通的轴映射
-       - R_fix_new:   当前用户想尝试的新 ee 修正
+       定义：
+       - right = -Y_base
+       - back  = -X_base
+       - down  = -Z_base
+
+       令：
+       - R_base: base_link 在世界系下的旋转
+       - R_fix:  ee_target_orientation_correction 对应旋转
+       - R_ref = R_base * R_fix
+
+       则最终目标局部坐标系在世界系下的三个轴方向为 R_ref 的三列。
+       我们希望手柄语义轴满足：
+       - X_hand -> target 中“朝右”的那根轴
+       - Y_hand -> target 中“朝后”的那根轴
+       - Z_hand -> target 中“朝下”的那根轴
+
+       因此先将这些语义方向写成世界向量，再投回 target 局部系：
+       - u_x = R_ref^T * v_right_world
+       - u_y = R_ref^T * v_back_world
+       - u_z = R_ref^T * v_down_world
+
+       最终：
+       U_eff = [u_x, u_y, u_z]
     """
 
     def __init__(self, config: TeleopFrameMapperConfig):
@@ -67,8 +78,6 @@ class TeleopFrameMapper:
         self.ee_target_orientation_correction_quat_wxyz = self.quat_from_euler_xyz_deg(
             *config.ee_target_orientation_correction_euler_xyz_deg
         )
-        self.relative_rotation_post_axis_map_effective = self._resolve_effective_relative_rotation_axis_map()
-
     @classmethod
     def from_telegrip_config(cls, telegrip_config) -> "TeleopFrameMapper":
         """
@@ -81,29 +90,6 @@ class TeleopFrameMapper:
         3. 末端固定姿态补偿
         只修改这里即可。
         """
-        relative_rotation_post_axis_map = cls.parse_axis_remap_matrix(
-            getattr(telegrip_config, "teleop_frame_relative_rotation_axis_map", [])
-        )
-        raw_relative_rotation_post_axis_map_calibration = getattr(
-            telegrip_config,
-            "teleop_frame_relative_rotation_axis_map_calibration",
-            None,
-        )
-        # 兼容配置中显式写了 [] 的情况：
-        # 这在语义上通常表示“没有单独提供标定基准矩阵”，
-        # 应退回到 relative_rotation_axis_map，而不是被误解释成单位阵。
-        if (
-            raw_relative_rotation_post_axis_map_calibration is None
-            or (isinstance(raw_relative_rotation_post_axis_map_calibration, list) and len(raw_relative_rotation_post_axis_map_calibration) == 0)
-        ):
-            raw_relative_rotation_post_axis_map_calibration = getattr(
-                telegrip_config,
-                "teleop_frame_relative_rotation_axis_map",
-                [],
-            )
-        relative_rotation_post_axis_map_calibration = cls.parse_axis_remap_matrix(
-            raw_relative_rotation_post_axis_map_calibration
-        )
         translation_euler_xyz_deg = tuple(
             float(v)
             for v in getattr(
@@ -120,54 +106,76 @@ class TeleopFrameMapper:
                 [0.0, 0.0, 0.0],
             )[:3]
         )
-        axis_map_calibration_reference_euler_xyz_deg = tuple(
-            float(v)
-            for v in getattr(
-                telegrip_config,
-                "teleop_frame_axis_map_calibration_reference_euler_xyz_deg",
-                ee_target_orientation_correction_euler_xyz_deg,
-            )[:3]
-        )
-        auto_update_relative_rotation_axis_map_from_ee_correction = bool(
-            getattr(
-                telegrip_config,
-                "teleop_frame_auto_update_relative_rotation_axis_map_from_ee_correction",
-                False,
-            )
-        )
         return cls(
             TeleopFrameMapperConfig(
                 translation_euler_xyz_deg=translation_euler_xyz_deg,
                 controller_delta_to_target_axis_map=np.eye(3, dtype=float),
-                relative_rotation_post_axis_map=relative_rotation_post_axis_map,
                 ee_target_orientation_correction_euler_xyz_deg=ee_target_orientation_correction_euler_xyz_deg,
-                auto_update_relative_rotation_axis_map_from_ee_correction=auto_update_relative_rotation_axis_map_from_ee_correction,
-                axis_map_calibration_reference_euler_xyz_deg=axis_map_calibration_reference_euler_xyz_deg,
-                relative_rotation_post_axis_map_calibration=relative_rotation_post_axis_map_calibration,
             )
         )
 
-    def _resolve_effective_relative_rotation_axis_map(self) -> np.ndarray:
-        """根据当前 R_fix 动态生成有效 U。"""
-        if not self.config.auto_update_relative_rotation_axis_map_from_ee_correction:
-            return self.config.relative_rotation_post_axis_map
+    def get_effective_relative_rotation_axis_map(
+        self,
+        origin_target_quat_wxyz: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        返回当前运行时实际生效的 U_eff。
 
-        q_fix_new = self.ee_target_orientation_correction_quat_wxyz
-        q_fix_calib = self.quat_from_euler_xyz_deg(
-            *self.config.axis_map_calibration_reference_euler_xyz_deg
-        )
-        R_fix_new = self.quat_to_rotation_matrix_wxyz(q_fix_new)
-        R_fix_calib = self.quat_to_rotation_matrix_wxyz(q_fix_calib)
-        U_calib = self.config.relative_rotation_post_axis_map_calibration
+        这里固定根据当前 base_link 姿态与 ee 修正，
+        按 right/back/down 语义动态计算 U_eff。
+        """
+        if origin_target_quat_wxyz is None:
+            return np.eye(3, dtype=float)
+        return self._build_semantic_relative_rotation_axis_map(origin_target_quat_wxyz)
 
-        # 让轴映射跟随当前 ee 修正一起旋转：
-        #   U_eff = R_fix_new * R_fix_calib^{-1} * U_calib
-        U_eff = R_fix_new @ R_fix_calib.T @ U_calib
-        return U_eff
+    def _build_semantic_relative_rotation_axis_map(
+        self,
+        origin_target_quat_wxyz: np.ndarray,
+    ) -> np.ndarray:
+        """
+        基于 base_link 语义方向动态构造 U_eff。
 
-    def get_effective_relative_rotation_axis_map(self) -> np.ndarray:
-        """返回当前运行时实际生效的 U_eff。"""
-        return np.asarray(self.relative_rotation_post_axis_map_effective, dtype=float).copy()
+        约定:
+        - right = -Y_base
+        - back  = -X_base
+        - down  = -Z_base
+
+        数学上：
+        1. R_base = Rot(q_origin)
+        2. R_fix  = Rot(q_ee_fix)
+        3. R_ref  = R_base * R_fix
+        4. 语义世界方向:
+           v_right = R_base * [ 0, -1,  0]^T
+           v_back  = R_base * [-1,  0,  0]^T
+           v_down  = R_base * [ 0,  0, -1]^T
+        5. 投回 target 局部系:
+           u_i = R_ref^T * v_i
+
+        因为 R_ref 的列向量就是 target 局部 XYZ 轴在世界系下的朝向，
+        所以 R_ref^T * v_i 表示“语义方向 v_i 在 target 局部坐标中的表达”。
+        将三个结果作为列拼起来，就得到手柄局部轴到 target 局部轴的映射 U_eff。
+        """
+        q_origin = self.normalize_wxyz(origin_target_quat_wxyz)
+        R_base = self.quat_to_rotation_matrix_wxyz(q_origin)
+        R_fix = self.quat_to_rotation_matrix_wxyz(self.ee_target_orientation_correction_quat_wxyz)
+        R_ref = R_base @ R_fix
+
+        v_right_world = R_base @ np.array([0.0, -1.0, 0.0], dtype=float)
+        v_back_world = R_base @ np.array([-1.0, 0.0, 0.0], dtype=float)
+        v_down_world = R_base @ np.array([0.0, 0.0, -1.0], dtype=float)
+
+        u_x = R_ref.T @ v_right_world
+        u_y = R_ref.T @ v_back_world
+        u_z = R_ref.T @ v_down_world
+        U_eff = np.column_stack((u_x, u_y, u_z))
+
+        # 数值误差下重新正交化，确保后续 U * R * U^T 仍是标准旋转变换。
+        u, _, vh = np.linalg.svd(U_eff)
+        U_eff_ortho = u @ vh
+        if np.linalg.det(U_eff_ortho) < 0.0:
+            u[:, -1] *= -1.0
+            U_eff_ortho = u @ vh
+        return U_eff_ortho
 
     @staticmethod
     def normalize_xyzw(q: np.ndarray) -> Optional[np.ndarray]:
@@ -281,25 +289,6 @@ class TeleopFrameMapper:
         qvq = TeleopFrameMapper.quat_multiply_wxyz(qv, TeleopFrameMapper.quat_inverse_wxyz(q))
         return qvq[1:4].copy()
 
-    @staticmethod
-    def parse_axis_remap_matrix(raw_matrix) -> np.ndarray:
-        identity = np.eye(3, dtype=float)
-        if raw_matrix is None:
-            return identity
-        if isinstance(raw_matrix, list) and len(raw_matrix) == 0:
-            return identity
-        try:
-            mat = np.asarray(raw_matrix, dtype=float)
-        except Exception:
-            return identity
-        if mat.shape != (3, 3) or not np.all(np.isfinite(mat)):
-            return identity
-        ortho_err = float(np.max(np.abs(mat @ mat.T - identity)))
-        det = float(np.linalg.det(mat))
-        if ortho_err > 1e-3 or abs(abs(det) - 1.0) > 1e-3:
-            return identity
-        return mat
-
     def map_relative_translation(self, delta_vr: np.ndarray) -> np.ndarray:
         return self.rotate_vec_by_quat_wxyz(delta_vr, self.translation_quat_wxyz)
 
@@ -329,7 +318,7 @@ class TeleopFrameMapper:
 
         R_delta_hand = self.quat_to_rotation_matrix_wxyz(q_delta_hand)
         S = self.config.controller_delta_to_target_axis_map
-        U = self.relative_rotation_post_axis_map_effective
+        U = self.get_effective_relative_rotation_axis_map(q_origin)
         R_delta_target = S @ R_delta_hand @ S.T
         R_delta_target = U @ R_delta_target @ U.T
         q_delta_target = self.quat_from_rotation_matrix_wxyz(R_delta_target)

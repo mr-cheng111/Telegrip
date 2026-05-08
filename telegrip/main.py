@@ -135,13 +135,6 @@ def create_config_from_args(args) -> TelegripConfig:
     config.teleop_frame_translation_euler_xyz_deg = (
         translation_euler if isinstance(translation_euler, list) else config.teleop_frame_translation_euler_xyz_deg
     )
-    rr_axis_map = teleop_frame_cfg.get(
-        "relative_rotation_axis_map",
-        config.teleop_frame_relative_rotation_axis_map,
-    )
-    config.teleop_frame_relative_rotation_axis_map = (
-        rr_axis_map if isinstance(rr_axis_map, list) else config.teleop_frame_relative_rotation_axis_map
-    )
     ee_orientation_correction = teleop_frame_cfg.get(
         "ee_target_orientation_correction_euler_xyz_deg",
         config.teleop_frame_ee_target_orientation_correction_euler_xyz_deg,
