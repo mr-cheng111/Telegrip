@@ -114,20 +114,6 @@ class TeleopFrameMapper:
             )
         )
 
-    def get_effective_relative_rotation_axis_map(
-        self,
-        origin_target_quat_wxyz: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """
-        返回当前运行时实际生效的 U_eff。
-
-        这里固定根据当前 base_link 姿态与 ee 修正，
-        按 right/back/down 语义动态计算 U_eff。
-        """
-        if origin_target_quat_wxyz is None:
-            return np.eye(3, dtype=float)
-        return self._build_semantic_relative_rotation_axis_map(origin_target_quat_wxyz)
-
     def _build_semantic_relative_rotation_axis_map(
         self,
         origin_target_quat_wxyz: np.ndarray,
@@ -318,7 +304,7 @@ class TeleopFrameMapper:
 
         R_delta_hand = self.quat_to_rotation_matrix_wxyz(q_delta_hand)
         S = self.config.controller_delta_to_target_axis_map
-        U = self.get_effective_relative_rotation_axis_map(q_origin)
+        U = self._build_semantic_relative_rotation_axis_map(q_origin)
         R_delta_target = S @ R_delta_hand @ S.T
         R_delta_target = U @ R_delta_target @ U.T
         q_delta_target = self.quat_from_rotation_matrix_wxyz(R_delta_target)

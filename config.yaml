@@ -20,6 +20,7 @@ control:
     posture_cost: 0.0001
     solve_damping: 1.0e-05
   teleop_frame:
+# 当前的这个坐标轴旋转姿态是相对于base_link的姿态旋转的，如果全都是0,那么目标的姿态就是和base_link一样的姿态。
     ee_target_orientation_correction_euler_xyz_deg:
     - -90.0
     - 0.0

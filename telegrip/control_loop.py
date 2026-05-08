@@ -132,12 +132,6 @@ class ControlLoop:
         self.is_running = False
         # 所有 teleop 相关的平移/姿态补偿统一收拢到 TeleopFrameMapper。
         self.frame_mapper = TeleopFrameMapper.from_telegrip_config(self.config)
-        effective_map = self.frame_mapper.get_effective_relative_rotation_axis_map()
-        if not np.allclose(effective_map, np.eye(3), atol=1e-9):
-            logger.info(
-                "Resolved effective relative rotation axis map after R_fix coupling:\n"
-                f"{effective_map}"
-            )
         # Guard to ensure startup joint_state->MuJoCo alignment runs only once.
         self._startup_joint_state_initialized = False
 
@@ -665,14 +659,6 @@ class ControlLoop:
                     q_init = self._get_base_link_orientation()
                 if q_init is None:
                     q_init = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
-
-                if logger.isEnabledFor(logging.INFO):
-                    effective_map = self.frame_mapper.get_effective_relative_rotation_axis_map(
-                        np.asarray(q_init, dtype=float)
-                    )
-                    logger.info(
-                        f"{goal.arm.upper()} semantic relative rotation axis map:\n{effective_map}"
-                    )
 
                 q_out = self.frame_mapper.map_target_orientation(
                     controller_delta_quat_wxyz=q_mapped,
