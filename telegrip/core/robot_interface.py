@@ -182,19 +182,38 @@ class RobotROSNode(Node):
         self.left_actual_angles = np.zeros(NUM_JOINTS)
         self.right_actual_angles = np.zeros(NUM_JOINTS)
 
-        self.joint_state_topic = str(
-            getattr(config, "ros2_joint_state_topic", "/joint_states") or "/joint_states"
+        self.left_joint_state_topic = str(
+            getattr(config, "ros2_left_joint_state_topic", "/left/joint_states_sim")
+            or "/left/joint_states_sim"
+        )
+        self.right_joint_state_topic = str(
+            getattr(config, "ros2_right_joint_state_topic", "/right/joint_states_sim")
+            or "/right/joint_states_sim"
+        )
+        self.left_joint_cmd_topic = str(
+            getattr(config, "ros2_left_joint_cmd_topic", "/left/joint_target")
+            or "/left/joint_target"
+        )
+        self.right_joint_cmd_topic = str(
+            getattr(config, "ros2_right_joint_cmd_topic", "/right/joint_target")
+            or "/right/joint_target"
         )
         self.aggregate_joint_cmd_topic = str(
             getattr(config, "ros2_aggregate_joint_cmd_topic", "/joint_target")
             or "/joint_target"
         )
 
-        self.aggregate_cmd_pub = self.create_publisher(JointState, self.aggregate_joint_cmd_topic, 10)
+        self.left_cmd_pub = self.create_publisher(JointState, self.left_joint_cmd_topic, 10)
+        self.right_cmd_pub = self.create_publisher(JointState, self.right_joint_cmd_topic, 10)
 
-        # 订阅聚合 /joint_states，并按关节名解析左右臂反馈。
-        self.all_state_sub = self.create_subscription(
-            JointState, self.joint_state_topic, self._joint_state_callback, 10
+        # 订阅双臂分话题反馈：
+        #   /left/joint_states_sim
+        #   /right/joint_states_sim
+        self.left_state_sub = self.create_subscription(
+            JointState, self.left_joint_state_topic, self._left_joint_state_callback, 10
+        )
+        self.right_state_sub = self.create_subscription(
+            JointState, self.right_joint_state_topic, self._right_joint_state_callback, 10
         )
         
         self.left_arm_connected = False
@@ -211,8 +230,10 @@ class RobotROSNode(Node):
         
         logger.info(
             "ROS2 robot interface node initialized: "
-            f"joint_state={self.joint_state_topic}, "
-            f"aggregate_cmd={self.aggregate_joint_cmd_topic}"
+            f"left_state={self.left_joint_state_topic}, "
+            f"right_state={self.right_joint_state_topic}, "
+            f"left_cmd={self.left_joint_cmd_topic}, "
+            f"right_cmd={self.right_joint_cmd_topic}"
         )
 
     @staticmethod
@@ -294,9 +315,12 @@ class RobotROSNode(Node):
             self.right_arm_connected = True
         return True
     
-    def _joint_state_callback(self, msg: JointState):
-        """Handle aggregated /joint_states that contains both arms."""
+    def _left_joint_state_callback(self, msg: JointState):
+        """Handle left-arm dedicated JointState topic."""
         self._update_arm_state_from_msg("left", msg)
+
+    def _right_joint_state_callback(self, msg: JointState):
+        """Handle right-arm dedicated JointState topic."""
         self._update_arm_state_from_msg("right", msg)
     
     def _gripper_angle_deg_to_main_norm(self, angle_deg: float) -> float:
@@ -339,6 +363,46 @@ class RobotROSNode(Node):
             arr[5] = -arr[5]
         return arr
 
+    def _build_single_arm_joint_target_msg(
+        self,
+        arm: str,
+        angles_deg: np.ndarray,
+        gripper_norm: Optional[float] = None,
+    ) -> JointState:
+        """
+        构造单臂 /left/joint_target 或 /right/joint_target 消息。
+
+        消息格式：
+          [joint1..joint6, gripper]
+        其中机械臂关节为弧度，夹爪为 0~1 归一化开合量。
+        """
+        cmd = self._model_deg_to_main_command_deg(angles_deg)
+        if cmd.size < NUM_JOINTS:
+            cmd = np.pad(cmd, (0, NUM_JOINTS - cmd.size), mode="constant")
+        cmd = np.nan_to_num(cmd[:NUM_JOINTS], nan=0.0, posinf=0.0, neginf=0.0)
+
+        if gripper_norm is None:
+            gripper_norm = self._gripper_closed_to_main_norm(
+                self.get_gripper_closed(arm)
+            )
+
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = [
+            f"{arm}_joint1",
+            f"{arm}_joint2",
+            f"{arm}_joint3",
+            f"{arm}_joint4",
+            f"{arm}_joint5",
+            f"{arm}_joint6",
+            f"{arm}_gripper",
+        ]
+        msg.position = [
+            *[float(v) for v in np.deg2rad(cmd)],
+            float(np.clip(gripper_norm, 0.0, 1.0)),
+        ]
+        return msg
+
     def publish_mainpy_dual_command(
         self,
         left_angles_deg: np.ndarray,
@@ -346,47 +410,15 @@ class RobotROSNode(Node):
         left_gripper_norm: Optional[float] = None,
         right_gripper_norm: Optional[float] = None,
     ):
-        """
-        发布给 mujoco_env/main.py 的单话题双臂 14 维控制命令。
-
-        格式固定为:
-            [left_joint1..6, left_gripper, right_joint1..6, right_gripper]
-        其中:
-            - 6 个机械臂关节使用弧度
-            - 夹爪使用 0~1 归一化量，1=open, 0=close
-        """
-        left = self._model_deg_to_main_command_deg(left_angles_deg)
-        right = self._model_deg_to_main_command_deg(right_angles_deg)
-        if left.size < NUM_JOINTS:
-            left = np.pad(left, (0, NUM_JOINTS - left.size), mode="constant")
-        if right.size < NUM_JOINTS:
-            right = np.pad(right, (0, NUM_JOINTS - right.size), mode="constant")
-
-        left = np.nan_to_num(left[:NUM_JOINTS], nan=0.0, posinf=0.0, neginf=0.0)
-        right = np.nan_to_num(right[:NUM_JOINTS], nan=0.0, posinf=0.0, neginf=0.0)
-
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = [
-            "left_joint1", "left_joint2", "left_joint3", "left_joint4", "left_joint5", "left_joint6", "left_gripper",
-            "right_joint1", "right_joint2", "right_joint3", "right_joint4", "right_joint5", "right_joint6", "right_gripper",
-        ]
-        if left_gripper_norm is None:
-            left_gripper_norm = self._gripper_closed_to_main_norm(
-                self.get_gripper_closed("left")
-            )
-        if right_gripper_norm is None:
-            right_gripper_norm = self._gripper_closed_to_main_norm(
-                self.get_gripper_closed("right")
-            )
-
-        msg.position = [
-            *[float(v) for v in np.deg2rad(left)],
-            float(np.clip(left_gripper_norm, 0.0, 1.0)),
-            *[float(v) for v in np.deg2rad(right)],
-            float(np.clip(right_gripper_norm, 0.0, 1.0)),
-        ]
-        self.aggregate_cmd_pub.publish(msg)
+        """分别发布左右臂 joint_target，不再依赖聚合 /joint_target。"""
+        left_msg = self._build_single_arm_joint_target_msg(
+            "left", left_angles_deg, gripper_norm=left_gripper_norm
+        )
+        right_msg = self._build_single_arm_joint_target_msg(
+            "right", right_angles_deg, gripper_norm=right_gripper_norm
+        )
+        self.left_cmd_pub.publish(left_msg)
+        self.right_cmd_pub.publish(right_msg)
     
     def check_connections(self):
         if not self.require_state_feedback:
@@ -548,7 +580,7 @@ class RobotInterface:
                             logger.warning("⚠️ ROS2 fallback enabled but no arm feedback detected yet")
                             self.is_connected = True
                         if self.require_joint_state_for_motion:
-                            logger.info("🔒 Motion gate active: waiting for /joint_states before sending commands")
+                            logger.info("🔒 Motion gate active: waiting for left/right joint_states before sending commands")
                         return True
                     self.is_connected = False
                     return False
@@ -557,7 +589,7 @@ class RobotInterface:
                 self.is_connected = True
                 logger.info("🤖 Robot interface connected via command streaming backend")
                 if self.require_joint_state_for_motion:
-                    logger.info("🔒 Motion gate active: waiting for /joint_states before sending commands")
+                    logger.info("🔒 Motion gate active: waiting for left/right joint_states before sending commands")
                 return True
 
             # Legacy ROS topic backend.
@@ -586,7 +618,7 @@ class RobotInterface:
             if not self.require_state_feedback:
                 logger.info("✅ Feedback check disabled: publishing commands without feedback gating")
             if self.require_joint_state_for_motion:
-                logger.info("🔒 Motion gate active: waiting for /joint_states before sending commands")
+                logger.info("🔒 Motion gate active: waiting for left/right joint_states before sending commands")
 
             return True
 
@@ -683,7 +715,7 @@ class RobotInterface:
             self.right_arm_connected = self.ros_node.right_arm_connected
 
     def _check_joint_state_motion_gate(self, spin_once: bool = True) -> Tuple[bool, bool]:
-        """Return (ready, just_opened) for motion gating by /joint_states availability."""
+        """Return (ready, just_opened) for motion gating by joint_state availability."""
         if not self.require_joint_state_for_motion:
             self._joint_state_gate_ready = True
             return True, False
@@ -710,7 +742,7 @@ class RobotInterface:
             self.right_arm_angles = self.ros_node.right_actual_angles.copy()
             self.left_sim_angles = self.left_arm_angles.copy()
             self.right_sim_angles = self.right_arm_angles.copy()
-            logger.info("✅ /joint_states received for both arms; motion gate opened")
+            logger.info("✅ joint_states received for both arms; motion gate opened")
 
         self._joint_state_gate_ready = ready
         return ready, just_opened
@@ -1103,7 +1135,10 @@ class RobotInterface:
         if not gate_ready:
             now = time.time()
             if now - self._last_joint_state_gate_warn_time >= self._joint_state_gate_warn_interval_s:
-                logger.warning("🚫 Motion blocked: waiting for /joint_states from both arms")
+                logger.warning(
+                    "🚫 Motion blocked: waiting for joint_states from both arms "
+                    f"(left={self.ros_node.left_joint_state_topic}, right={self.ros_node.right_joint_state_topic})"
+                )
                 self._last_joint_state_gate_warn_time = now
             return False
         if gate_just_opened:
@@ -1169,8 +1204,8 @@ class RobotInterface:
                     self.left_arm_connected = False
                     self.right_arm_connected = False
             else:
-                # ROS2 模式下，telegrip 现在只保留与 mujoco_env/main.py 对齐的聚合命令链路：
-                #   /joint_states_sim -> telegrip -> /joint_target
+                # ROS2 模式下，telegrip 现在使用左右分话题命令链路：
+                #   /left|right/joint_states_sim -> telegrip -> /left|right/joint_target
                 # ENTERING: 不发命令
                 # INITIALIZING: 周期发送参考姿态
                 # EXECUTING: 周期发送当前目标角
@@ -1202,7 +1237,7 @@ class RobotInterface:
                             right_gripper_norm=right_gripper,
                         )
                     except Exception as e:
-                        logger.error(f"Error sending aggregate /joint_target command: {e}")
+                        logger.error(f"Error sending split /left|/right joint_target command: {e}")
                         success = False
 
             self.last_send_time = current_time

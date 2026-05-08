@@ -78,7 +78,7 @@ control:
     lm_damping: 1.0
     # 每个控制周期内的 IK 最大迭代次数。越大收敛更充分，但计算开销更高。
     max_iters: 20
-    mujoco_scene: mink/examples/arm620/scene_dual_unified_base.xml
+    mujoco_scene: mink/examples/arm620/scene_dual.xml
     # 末端姿态误差权重（无量纲）。越大越优先“对准方向”。
     orientation_cost: 0.1
     # 姿态收敛阈值（单位：弧度，旋转向量范数）。越小要求越严格。
@@ -116,7 +116,7 @@ gripper:
   open_angle: 0.0
 ik:
   hysteresis_threshold: 0.05
-  initial_reached_tolerance_deg: 3.0
+  initial_reached_tolerance_deg: 5.0
   initial_joint_positions_deg:
     left:
     - 90.0
@@ -145,7 +145,10 @@ robot:
   command_backend: ros2_topic
   require_joint_state_for_motion: true
   ros2:
-    joint_state_topic: /joint_states_sim
+    left_joint_state_topic: /left/joint_states_sim
+    right_joint_state_topic: /right/joint_states_sim
+    left_joint_cmd_topic: /left/joint_target
+    right_joint_cmd_topic: /right/joint_target
     aggregate_joint_cmd_topic: /joint_target
   arm_controller:
     workspace: /home/nvidia/Projects/universal-arm-controller

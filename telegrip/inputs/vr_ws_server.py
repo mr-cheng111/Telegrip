@@ -70,6 +70,55 @@ class VRWebSocketServer(BaseInputProvider):
         logger.info(f"VR orientation reference mode: {self.orientation_reference_mode}")
 
     @staticmethod
+    def _quat_xyzw_to_euler_xyz_deg(q_xyzw: np.ndarray) -> Optional[np.ndarray]:
+        """
+        将手柄四元数 [x, y, z, w] 转成 XYZ 欧拉角（单位：度）。
+
+        公式来源：
+          1. 先由四元数得到旋转矩阵 R
+          2. 按 XYZ 固定轴分解，满足：
+               R = Rz(rz) * Ry(ry) * Rx(rx)
+        """
+        q_norm = TeleopFrameMapper.normalize_xyzw(q_xyzw)
+        if q_norm is None:
+            return None
+        q_wxyz = TeleopFrameMapper.xyzw_to_wxyz(q_norm)
+        R = TeleopFrameMapper.quat_to_rotation_matrix_wxyz(q_wxyz)
+
+        sy = float(np.clip(R[0, 2], -1.0, 1.0))
+        ry = np.arcsin(sy)
+        cy = np.cos(ry)
+
+        if abs(cy) > 1e-8:
+            rx = np.arctan2(-R[1, 2], R[2, 2])
+            rz = np.arctan2(-R[0, 1], R[0, 0])
+        else:
+            # 万向节附近退化为一组稳定解，固定 rz=0。
+            rx = np.arctan2(R[2, 1], R[1, 1])
+            rz = 0.0
+
+        return np.rad2deg(np.array([rx, ry, rz], dtype=float))
+
+    def _log_controller_reference_pose(self, hand: str, q_xyzw: np.ndarray, reason: str):
+        """把当前手柄参考姿态直接输出到日志，方便调坐标系。"""
+        q_norm = self._normalize_xyzw(np.asarray(q_xyzw, dtype=float))
+        if q_norm is None:
+            logger.warning(f"{hand.upper()} controller reference pose unavailable: invalid quaternion")
+            return
+        euler_xyz_deg = self._quat_xyzw_to_euler_xyz_deg(q_norm)
+        if euler_xyz_deg is None:
+            logger.info(
+                f"{hand.upper()} controller reference pose ({reason}): "
+                f"quat_xyzw={np.round(q_norm, 6)}"
+            )
+            return
+        logger.info(
+            f"{hand.upper()} controller reference pose ({reason}): "
+            f"quat_xyzw={np.round(q_norm, 6)}, "
+            f"euler_xyz_deg={np.round(euler_xyz_deg, 2)}"
+        )
+
+    @staticmethod
     def _normalize_xyzw(q: np.ndarray) -> np.ndarray:
         return TeleopFrameMapper.normalize_xyzw(q)
 
@@ -105,6 +154,7 @@ class VRWebSocketServer(BaseInputProvider):
                     nq = self._normalize_xyzw(np.array(q[:4], dtype=float))
                     if nq is not None:
                         self.hand_orientation_ref_xyzw[hand] = nq
+                        self._log_controller_reference_pose(hand, nq, "loaded_from_config")
             if self.hand_orientation_ref_xyzw["left"] is not None and self.hand_orientation_ref_xyzw["right"] is not None:
                 logger.info("Loaded VR orientation references from config.yaml")
         except Exception as e:
@@ -415,6 +465,7 @@ class VRWebSocketServer(BaseInputProvider):
                         [quaternion['x'], quaternion['y'], quaternion['z'], quaternion['w']],
                         dtype=float,
                     )
+                    self._log_controller_reference_pose(hand, controller.origin_quaternion, "grip_origin")
                 else:
                     controller.origin_quaternion = None
                 

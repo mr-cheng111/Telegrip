@@ -42,7 +42,10 @@ DEFAULT_CONFIG = {
         },
         "command_backend": "ros2_topic",
         "ros2": {
-            "joint_state_topic": "/joint_states",
+            "left_joint_state_topic": "/left/joint_states_sim",
+            "right_joint_state_topic": "/right/joint_states_sim",
+            "left_joint_cmd_topic": "/left/joint_target",
+            "right_joint_cmd_topic": "/right/joint_target",
             "aggregate_joint_cmd_topic": "/joint_target",
         },
         "arm_controller": {
@@ -281,8 +284,17 @@ class TelegripConfig:
     arm_command_max_step_deg: float = float(
         _config_data["robot"].get("arm_controller", {}).get("max_step_deg", 0.0)
     )
-    ros2_joint_state_topic: str = str(
-        _config_data["robot"].get("ros2", {}).get("joint_state_topic", "/joint_states")
+    ros2_left_joint_state_topic: str = str(
+        _config_data["robot"].get("ros2", {}).get("left_joint_state_topic", "/left/joint_states_sim")
+    )
+    ros2_right_joint_state_topic: str = str(
+        _config_data["robot"].get("ros2", {}).get("right_joint_state_topic", "/right/joint_states_sim")
+    )
+    ros2_left_joint_cmd_topic: str = str(
+        _config_data["robot"].get("ros2", {}).get("left_joint_cmd_topic", "/left/joint_target")
+    )
+    ros2_right_joint_cmd_topic: str = str(
+        _config_data["robot"].get("ros2", {}).get("right_joint_cmd_topic", "/right/joint_target")
     )
     ros2_aggregate_joint_cmd_topic: str = str(
         _config_data["robot"].get("ros2", {}).get("aggregate_joint_cmd_topic", "/joint_target")
@@ -408,7 +420,18 @@ class TelegripConfig:
         self.arm_controller_right_mapping = str(self.arm_controller_right_mapping or "right_arm").strip()
         self.arm_command_interpolation_alpha = float(np.clip(self.arm_command_interpolation_alpha, 0.0, 1.0))
         self.arm_command_max_step_deg = max(0.0, float(self.arm_command_max_step_deg))
-        self.ros2_joint_state_topic = str(self.ros2_joint_state_topic or "/joint_states").strip()
+        self.ros2_left_joint_state_topic = str(
+            self.ros2_left_joint_state_topic or "/left/joint_states_sim"
+        ).strip()
+        self.ros2_right_joint_state_topic = str(
+            self.ros2_right_joint_state_topic or "/right/joint_states_sim"
+        ).strip()
+        self.ros2_left_joint_cmd_topic = str(
+            self.ros2_left_joint_cmd_topic or "/left/joint_target"
+        ).strip()
+        self.ros2_right_joint_cmd_topic = str(
+            self.ros2_right_joint_cmd_topic or "/right/joint_target"
+        ).strip()
         self.ros2_aggregate_joint_cmd_topic = str(
             self.ros2_aggregate_joint_cmd_topic or "/joint_target"
         ).strip()

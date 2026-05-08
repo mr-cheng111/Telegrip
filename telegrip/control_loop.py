@@ -608,7 +608,7 @@ class ControlLoop:
         if self.robot_interface and not self.robot_interface.is_motion_gate_ready():
             logger.warning(
                 f"⏸ {arm.upper()} arm position-control request ignored: "
-                "waiting for /joint_states gate"
+                "waiting for left/right joint_states gate"
             )
             return False
 

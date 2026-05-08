@@ -98,8 +98,17 @@ def create_config_from_args(args) -> TelegripConfig:
         arm_controller_cfg.get("max_step_deg", config.arm_command_max_step_deg)
     )
     ros2_cfg = robot_cfg.get("ros2", {})
-    config.ros2_joint_state_topic = str(
-        ros2_cfg.get("joint_state_topic", config.ros2_joint_state_topic)
+    config.ros2_left_joint_state_topic = str(
+        ros2_cfg.get("left_joint_state_topic", config.ros2_left_joint_state_topic)
+    )
+    config.ros2_right_joint_state_topic = str(
+        ros2_cfg.get("right_joint_state_topic", config.ros2_right_joint_state_topic)
+    )
+    config.ros2_left_joint_cmd_topic = str(
+        ros2_cfg.get("left_joint_cmd_topic", config.ros2_left_joint_cmd_topic)
+    )
+    config.ros2_right_joint_cmd_topic = str(
+        ros2_cfg.get("right_joint_cmd_topic", config.ros2_right_joint_cmd_topic)
     )
     config.ros2_aggregate_joint_cmd_topic = str(
         ros2_cfg.get("aggregate_joint_cmd_topic", config.ros2_aggregate_joint_cmd_topic)
